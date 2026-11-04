@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+target/
+rust/target/
+*.apk
+*.idsig
+*.class
+*.dex
+
+# Keystores and local secrets
+*.key
+*.pem
+/tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
