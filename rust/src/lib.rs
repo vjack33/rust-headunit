@@ -62,6 +62,7 @@ struct ActiveSession {
 }
 
 static ACTIVE_SESSION: Mutex<Option<ActiveSession>> = Mutex::new(None);
+static ACTIVE_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
 
 fn log_info(msg: &str) {
     let tag = CString::new("RustHeadunit").unwrap();
@@ -255,6 +256,10 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
                         log_info(&format!("[AAP Server] Phone connected from: {} (local port: {})", client_addr, local_p));
                         stream.set_nodelay(true).ok();
                         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+
+                        if let Ok(mut guard) = ACTIVE_STREAM.lock() {
+                            *guard = stream.try_clone().ok();
+                        }
 
                         // Optimize TCP receive buffer to 2MB, enable QUICKACK, and boost thread priority to realtime (-16)
                         use std::os::unix::io::AsRawFd;
@@ -733,10 +738,37 @@ fn handle_aap_session(
     if let Ok(mut guard) = ACTIVE_SESSION.lock() {
         *guard = None;
     }
+    if let Ok(mut guard) = ACTIVE_STREAM.lock() {
+        *guard = None;
+    }
 
     if let Some(dec) = decoder.as_mut() {
         dec.close();
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_openheadunit_rust_NativeCore_killSession(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    log_info("[NativeCore] killSession requested: terminating AAP session...");
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        if let Some(session) = guard.as_mut() {
+            let byebye_req = [0x00, 0x0F, 0x08, 0x01]; // ByeByeRequest
+            let _ = write_frame(&mut session.write_stream, &session.tls, ID_CTR, FLAG_SINGLE, &byebye_req, true);
+            let _ = session.write_stream.shutdown(std::net::Shutdown::Both);
+        }
+        *guard = None;
+    }
+    if let Ok(mut guard) = ACTIVE_STREAM.lock() {
+        if let Some(stream) = guard.as_ref() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        *guard = None;
+    }
+    IS_PROJECTING.store(false, Ordering::SeqCst);
+    SESSION_STATE.store(0, Ordering::SeqCst);
 }
 
 #[no_mangle]

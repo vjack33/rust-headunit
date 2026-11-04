@@ -90,9 +90,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView tvBadge;
     private TextView tvBottomInfo;
     private ProgressBar progressBar;
-    private Button btnWakeNow;
+    private Button btnStartStopAa;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private volatile boolean isOverlayHidden = false;
+    private final AtomicBoolean isConnectionRequested = new AtomicBoolean(false);
 
     // User Settings & Preferences
     private static final String PREFS_NAME = "HeadunitPrefs";
@@ -112,10 +113,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private View settingsOverlayView;
     private Button btnSettings;
-    private Button floatingSettingsBtn;
+    private LinearLayout floatingControlsView;
 
     private BluetoothServerSocket aaServerSocket;
     private BluetoothServerSocket hfpServerSocket;
+    private BluetoothSocket activeAaSocket;
     private BluetoothSocket activeHfpSocket;
     private NsdManager nsdManager;
     private NsdManager.RegistrationListener nsdListener;
@@ -157,19 +159,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        // Floating quick-settings button during active AA video streaming
-        floatingSettingsBtn = new Button(this);
-        floatingSettingsBtn.setText("⚙");
-        floatingSettingsBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        floatingSettingsBtn.setTextColor(Color.WHITE);
-        floatingSettingsBtn.setBackground(makeRoundedDrawable(Color.parseColor("#B30F172A"), Color.parseColor("#334155"), dp(1), dp(18)));
-        FrameLayout.LayoutParams floatLp = new FrameLayout.LayoutParams(dp(36), dp(36));
+        // Floating Quick Controls during active AA video streaming: [ ⚙ Settings ] [ ✕ Exit AA ]
+        floatingControlsView = new LinearLayout(this);
+        floatingControlsView.setOrientation(LinearLayout.HORIZONTAL);
+        floatingControlsView.setGravity(Gravity.CENTER_VERTICAL);
+        floatingControlsView.setBackground(makeRoundedDrawable(Color.parseColor("#CC0B1220"), Color.parseColor("#334155"), dp(1), dp(18)));
+        floatingControlsView.setPadding(dp(6), dp(4), dp(6), dp(4));
+
+        FrameLayout.LayoutParams floatLp = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        );
         floatLp.gravity = Gravity.TOP | Gravity.START;
         floatLp.setMargins(dp(12), dp(12), 0, 0);
-        floatingSettingsBtn.setLayoutParams(floatLp);
-        floatingSettingsBtn.setVisibility(View.GONE);
-        floatingSettingsBtn.setOnClickListener(v -> showSettings());
-        rootLayout.addView(floatingSettingsBtn);
+        floatingControlsView.setLayoutParams(floatLp);
+        floatingControlsView.setVisibility(View.GONE);
+
+        // 1. Settings button
+        Button btnFloatSettings = new Button(this);
+        btnFloatSettings.setText("⚙ Settings");
+        btnFloatSettings.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        btnFloatSettings.setTypeface(Typeface.DEFAULT_BOLD);
+        btnFloatSettings.setTextColor(Color.WHITE);
+        btnFloatSettings.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#475569"), dp(1), dp(14)));
+        btnFloatSettings.setPadding(dp(10), dp(4), dp(10), dp(4));
+        btnFloatSettings.setOnClickListener(v -> showSettings());
+        floatingControlsView.addView(btnFloatSettings);
+
+        // 2. Kill / Exit AA button
+        Button btnFloatExit = new Button(this);
+        btnFloatExit.setText("✕ Exit AA");
+        btnFloatExit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        btnFloatExit.setTypeface(Typeface.DEFAULT_BOLD);
+        btnFloatExit.setTextColor(Color.parseColor("#FCA5A5"));
+        btnFloatExit.setBackground(makeRoundedDrawable(Color.parseColor("#7F1D1D"), Color.parseColor("#DC2626"), dp(1), dp(14)));
+        btnFloatExit.setPadding(dp(10), dp(4), dp(10), dp(4));
+        LinearLayout.LayoutParams exitLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        exitLp.setMargins(dp(6), 0, 0, 0);
+        btnFloatExit.setLayoutParams(exitLp);
+        btnFloatExit.setOnClickListener(v -> killAndroidAuto());
+        floatingControlsView.addView(btnFloatExit);
+
+        rootLayout.addView(floatingControlsView);
 
         settingsOverlayView = buildSettingsOverlayView();
         settingsOverlayView.setVisibility(View.GONE);
@@ -359,7 +393,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         headerRow.addView(titleCol);
 
         tvBadge = new TextView(this);
-        tvBadge.setText("INITIALIZING");
+        tvBadge.setText("STANDBY");
         tvBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         tvBadge.setTypeface(Typeface.DEFAULT_BOLD);
         tvBadge.setTextColor(Color.parseColor("#38BDF8"));
@@ -400,10 +434,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(dp(36), dp(36));
         pbLp.gravity = Gravity.CENTER_HORIZONTAL;
         pbLp.setMargins(0, 0, 0, dp(10));
+        progressBar.setVisibility(View.GONE);
         centerCard.addView(progressBar, pbLp);
 
         tvMainStatus = new TextView(this);
-        tvMainStatus.setText("Waiting for S25 Ultra...");
+        tvMainStatus.setText("Android Auto Standby");
         tvMainStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
         tvMainStatus.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         tvMainStatus.setTextColor(Color.parseColor("#F8FAFC"));
@@ -411,7 +446,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         centerCard.addView(tvMainStatus);
 
         tvSubStatus = new TextView(this);
-        tvSubStatus.setText("Starting Wi-Fi Direct and listening for Bluetooth triggers...");
+        tvSubStatus.setText("Tap 'Start Android Auto' to connect wirelessly to your phone");
         tvSubStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         tvSubStatus.setTextColor(Color.parseColor("#94A3B8"));
         tvSubStatus.setGravity(Gravity.CENTER);
@@ -428,10 +463,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         stepBox.setBackground(makeRoundedDrawable(Color.parseColor("#0F172A"), Color.parseColor("#1E293B"), dp(1), dp(8)));
         stepBox.setPadding(dp(14), dp(10), dp(14), dp(10));
 
-        tvStepWifi = createStepTextView("● Wi-Fi Direct: Initializing...");
-        tvStepBt   = createStepTextView("● Bluetooth Poke: Ready");
-        tvStepWpp  = createStepTextView("● WPP Handshake: Waiting for phone...");
-        tvStepAap  = createStepTextView("● AAP Stream: Port " + AAP_PORT + " listening...");
+        tvStepWifi = createStepTextView("● Wi-Fi Direct: Active (" + p2pSsid + ")");
+        tvStepBt   = createStepTextView("● Bluetooth: Standby");
+        tvStepWpp  = createStepTextView("● WPP Handshake: Standby");
+        tvStepAap  = createStepTextView("● AAP Stream: Port " + AAP_PORT + " listening");
 
         stepBox.addView(tvStepWifi);
         stepBox.addView(tvStepBt);
@@ -439,31 +474,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         stepBox.addView(tvStepAap);
         centerCard.addView(stepBox);
 
-        // Action Button
-        btnWakeNow = new Button(this);
-        btnWakeNow.setText("⚡ Wake Phone Now");
-        btnWakeNow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        btnWakeNow.setTypeface(Typeface.DEFAULT_BOLD);
-        btnWakeNow.setTextColor(Color.WHITE);
-        btnWakeNow.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), 0, 0, dp(8)));
-        btnWakeNow.setPadding(dp(20), dp(10), dp(20), dp(10));
+        // Action Button: Primary Start / Stop Android Auto trigger
+        btnStartStopAa = new Button(this);
+        btnStartStopAa.setText("🚀 Start Android Auto");
+        btnStartStopAa.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        btnStartStopAa.setTypeface(Typeface.DEFAULT_BOLD);
+        btnStartStopAa.setTextColor(Color.WHITE);
+        btnStartStopAa.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), 0, 0, dp(8)));
+        btnStartStopAa.setPadding(dp(24), dp(10), dp(24), dp(10));
         LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         );
         btnLp.gravity = Gravity.CENTER_HORIZONTAL;
         btnLp.setMargins(0, dp(14), 0, dp(8));
-        btnWakeNow.setLayoutParams(btnLp);
-        btnWakeNow.setOnClickListener(v -> {
-            btnWakeNow.setEnabled(false);
-            btnWakeNow.setText("⚡ Waking...");
-            pokeOnce();
-            uiHandler.postDelayed(() -> {
-                btnWakeNow.setEnabled(true);
-                btnWakeNow.setText("⚡ Wake Phone Now");
-            }, 3500);
+        btnStartStopAa.setLayoutParams(btnLp);
+        btnStartStopAa.setOnClickListener(v -> {
+            if (!isConnectionRequested.get()) {
+                startAndroidAuto();
+            } else {
+                killAndroidAuto();
+            }
         });
-        centerCard.addView(btnWakeNow);
+        centerCard.addView(btnStartStopAa);
 
         // Last log line
         tvLastLog = new TextView(this);
@@ -749,12 +782,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         card.addView(rowFps);
 
         // Action Buttons Row
+        // Action Buttons Row: [ 🛑 Kill Android Auto ] ---- [ Cancel ] [ Save & Apply ]
         LinearLayout actionRow = new LinearLayout(this);
         actionRow.setOrientation(LinearLayout.HORIZONTAL);
-        actionRow.setGravity(Gravity.END);
+        actionRow.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams actLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         actLp.setMargins(0, dp(10), 0, 0);
         actionRow.setLayoutParams(actLp);
+
+        Button btnKill = new Button(this);
+        btnKill.setText("🛑 Kill Android Auto");
+        btnKill.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        btnKill.setTypeface(Typeface.DEFAULT_BOLD);
+        btnKill.setTextColor(Color.parseColor("#FCA5A5"));
+        btnKill.setBackground(makeRoundedDrawable(Color.parseColor("#450A0A"), Color.parseColor("#DC2626"), dp(1), dp(8)));
+        btnKill.setPadding(dp(12), dp(6), dp(12), dp(6));
+        btnKill.setOnClickListener(v -> {
+            hideSettings();
+            killAndroidAuto();
+        });
+        actionRow.addView(btnKill);
+
+        View spacer = new View(this);
+        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(0, dp(1), 1.0f);
+        actionRow.addView(spacer, spLp);
 
         Button btnCancel = new Button(this);
         btnCancel.setText("Cancel");
@@ -863,8 +914,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             settingsOverlayView.setAlpha(0f);
             settingsOverlayView.animate().alpha(1f).setDuration(250);
         }
-        if (floatingSettingsBtn != null) {
-            floatingSettingsBtn.setVisibility(View.GONE);
+        if (floatingControlsView != null) {
+            floatingControlsView.setVisibility(View.GONE);
         }
     }
 
@@ -874,11 +925,99 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 settingsOverlayView.setVisibility(View.GONE);
             });
         }
-        if (floatingSettingsBtn != null && isOverlayHidden) {
-            floatingSettingsBtn.setVisibility(View.VISIBLE);
-            floatingSettingsBtn.setAlpha(0f);
-            floatingSettingsBtn.animate().alpha(0.6f).setDuration(250);
+        if (floatingControlsView != null && isOverlayHidden) {
+            floatingControlsView.setVisibility(View.VISIBLE);
+            floatingControlsView.setAlpha(0f);
+            floatingControlsView.animate().alpha(1f).setDuration(250);
         }
+    }
+
+    private void startAndroidAuto() {
+        runOnUiThread(() -> {
+            isConnectionRequested.set(true);
+            tvBadge.setText("CONNECTING");
+            tvBadge.setTextColor(Color.parseColor("#FBBF24"));
+            tvBadge.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#FBBF24"), dp(1), dp(12)));
+            progressBar.setVisibility(View.VISIBLE);
+            tvMainStatus.setText("Connecting to Phone...");
+            tvSubStatus.setText("Waking phone & negotiating wireless connection...");
+            btnStartStopAa.setText("🛑 Stop Connecting");
+            btnStartStopAa.setBackground(makeRoundedDrawable(Color.parseColor("#DC2626"), 0, 0, dp(8)));
+            updateStep(tvStepBt, "● Bluetooth: Sending wake signal...", Color.parseColor("#FBBF24"));
+            addLog("User started Android Auto wireless link");
+            pokeOnce();
+        });
+    }
+
+    private void killAndroidAuto() {
+        runOnUiThread(() -> {
+            Log.i(TAG, "[KILL] Stopping Android Auto session & returning to home screen");
+            isConnectionRequested.set(false);
+
+            // 1. Terminate native AAP session & hardware decoder
+            NativeCore.killSession();
+
+            // 2. Close Bluetooth RFCOMM sockets if open
+            try {
+                if (activeAaSocket != null) {
+                    activeAaSocket.close();
+                    activeAaSocket = null;
+                }
+            } catch (Exception ignored) {}
+            try {
+                if (activeHfpSocket != null) {
+                    activeHfpSocket.close();
+                    activeHfpSocket = null;
+                }
+            } catch (Exception ignored) {}
+            isAaConnected.set(false);
+            isHfpConnected.set(false);
+
+            // 3. Hide floating controls and settings modal
+            if (floatingControlsView != null) {
+                floatingControlsView.setVisibility(View.GONE);
+            }
+            if (settingsOverlayView != null) {
+                settingsOverlayView.setVisibility(View.GONE);
+            }
+
+            // 4. Restore connection dashboard
+            isOverlayHidden = false;
+            if (overlayView != null) {
+                overlayView.setVisibility(View.VISIBLE);
+                overlayView.setAlpha(0f);
+                overlayView.animate().alpha(1f).setDuration(250);
+            }
+
+            // 5. Reset UI to Standby state
+            resetToStandbyUI("Android Auto Stopped", "Session ended. Tap 'Start Android Auto' to connect again.");
+            addLog("Android Auto session stopped by user");
+            Toast.makeText(MainActivity.this, "Android Auto stopped. Returned to Home.", Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    private void resetToStandbyUI(String mainText, String subText) {
+        if (tvBadge != null) {
+            tvBadge.setText("STANDBY");
+            tvBadge.setTextColor(Color.parseColor("#38BDF8"));
+            tvBadge.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#38BDF8"), dp(1), dp(12)));
+        }
+        if (progressBar != null) {
+            progressBar.setVisibility(View.GONE);
+        }
+        if (tvMainStatus != null) {
+            tvMainStatus.setText(mainText);
+        }
+        if (tvSubStatus != null) {
+            tvSubStatus.setText(subText);
+        }
+        if (btnStartStopAa != null) {
+            btnStartStopAa.setText("🚀 Start Android Auto");
+            btnStartStopAa.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), 0, 0, dp(8)));
+        }
+        updateStep(tvStepBt, "● Bluetooth: Standby", Color.parseColor("#64748B"));
+        updateStep(tvStepWpp, "● WPP Handshake: Standby", Color.parseColor("#64748B"));
+        updateStep(tvStepAap, "● AAP Stream: Port " + AAP_PORT + " listening", Color.parseColor("#64748B"));
     }
 
     private int lastReportedState = -1;
@@ -900,10 +1039,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             .alpha(0f)
                             .setDuration(400)
                             .withEndAction(() -> overlayView.setVisibility(View.GONE));
-                        if (floatingSettingsBtn != null) {
-                            floatingSettingsBtn.setVisibility(View.VISIBLE);
-                            floatingSettingsBtn.setAlpha(0f);
-                            floatingSettingsBtn.animate().alpha(0.6f).setDuration(400);
+                        if (floatingControlsView != null) {
+                            floatingControlsView.setVisibility(View.VISIBLE);
+                            floatingControlsView.setAlpha(0f);
+                            floatingControlsView.animate().alpha(1f).setDuration(400);
                         }
                     }
                 } else {
@@ -913,10 +1052,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         overlayView.setVisibility(View.VISIBLE);
                         overlayView.setAlpha(0f);
                         overlayView.animate().alpha(1f).setDuration(300);
-                        if (floatingSettingsBtn != null) {
-                            floatingSettingsBtn.animate().alpha(0f).setDuration(200).withEndAction(() -> {
-                                floatingSettingsBtn.setVisibility(View.GONE);
+                        if (floatingControlsView != null) {
+                            floatingControlsView.animate().alpha(0f).setDuration(200).withEndAction(() -> {
+                                floatingControlsView.setVisibility(View.GONE);
                             });
+                        }
+                        if (!isConnectionRequested.get()) {
+                            resetToStandbyUI("Android Auto Standby", "Tap 'Start Android Auto' to connect wirelessly to your phone");
                         }
                     }
 
@@ -934,10 +1076,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             setStatus("Starting Projection...", "Configuring video stream & touch channels...", "PROTOCOL SETUP", Color.parseColor("#A855F7"));
                             updateStep(tvStepAap, "● AAP: Configuring 1280x720 video...", Color.parseColor("#A855F7"));
                             addLog("AAP Protocol Setup / Service Discovery");
-                        } else if (state == 5) { // DISCONNECTED
-                            setStatus("Session Disconnected", "Waiting for phone reconnection...", "DISCONNECTED", Color.parseColor("#F87171"));
-                            updateStep(tvStepAap, "○ AAP Stream: Disconnected", Color.parseColor("#94A3B8"));
-                            addLog("AAP Session disconnected");
+                        } else if (state == 5 || state == 0) { // DISCONNECTED or IDLE
+                            if (!isConnectionRequested.get()) {
+                                resetToStandbyUI("Android Auto Standby", "Tap 'Start Android Auto' to connect wirelessly to your phone");
+                            } else {
+                                setStatus("Session Disconnected", "Waiting for phone reconnection...", "DISCONNECTED", Color.parseColor("#F87171"));
+                                updateStep(tvStepAap, "○ AAP Stream: Disconnected", Color.parseColor("#94A3B8"));
+                                addLog("AAP Session disconnected");
+                            }
                         }
                     }
                 }
@@ -1272,7 +1418,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         if (socket != null) {
                             Log.i(TAG, "[AA-SERVER INCOMING] Phone connected via RFCOMM: " 
                                 + socket.getRemoteDevice().getName() + " (" + socket.getRemoteDevice().getAddress() + ")");
+                            activeAaSocket = socket;
                             isAaConnected.set(true);
+                            isConnectionRequested.set(true);
                             updateStep(tvStepBt, "✓ BT RFCOMM: Phone connected (" + socket.getRemoteDevice().getName() + ")", Color.parseColor("#4ADE80"));
                             setStatus("Phone Connected (BT)", "Starting Wireless Projection Protocol handshake...", "BT PAIRED", Color.parseColor("#38BDF8"));
                             addLog("Phone connected to RFCOMM: " + socket.getRemoteDevice().getName());
@@ -1372,11 +1520,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void startWakeupPokeLoop() {
         new Thread(() -> {
             while (isRunning.get()) {
-                if (!isAaConnected.get() && !isHfpConnected.get() && !NativeCore.isProjecting()) {
+                if (isConnectionRequested.get() && !isAaConnected.get() && !isHfpConnected.get() && !NativeCore.isProjecting()) {
                     pokeOnce();
                 }
                 try {
-                    Thread.sleep(15000);
+                    Thread.sleep(12000);
                 } catch (InterruptedException ignored) {}
             }
         }, "WakeupPoke").start();
