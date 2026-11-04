@@ -31,6 +31,8 @@ cd "$PROJ"
 aapt2 compile --dir "$PROJ/res" -o "$PROJ/build/res.zip"
 aapt2 link -I "$ANDROID_JAR" \
   --manifest "$PROJ/AndroidManifest.xml" \
+  --min-sdk-version 21 \
+  --target-sdk-version 30 \
   "$PROJ/build/res.zip" \
   -o "$PROJ/build/unaligned.apk"
 
@@ -45,6 +47,7 @@ echo "=== [5/5] Deploying to Oppo A37 (9da08b05) ==="
 adb -s 9da08b05 install -r "$PROJ/rust_headunit.apk"
 
 # Pre-grant location permissions for Wi-Fi Direct on Android 11
+adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.INTERNET 2>/dev/null || true"
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true"
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.ACCESS_COARSE_LOCATION 2>/dev/null || true"
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.RECORD_AUDIO 2>/dev/null || true"

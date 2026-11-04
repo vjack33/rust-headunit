@@ -83,21 +83,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        View decorView = getWindow().getDecorView();
-        decorView.setSystemUiVisibility(
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-        );
+        hideSystemUI();
 
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().addCallback(this);
-        setContentView(surfaceView);
+        // Pin the Surface buffer to the exact video resolution so SurfaceFlinger
+        // composites at 1:1 pixel ratio — prevents DPI-scaled cropping on hdpi displays.
+        surfaceView.getHolder().setFixedSize(1280, 720);
+        setContentView(surfaceView,
+            new android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
 
-        // Touch forwarding to Rust Native Input Channel
+        // Touch forwarding to Rust Native Input Channel (scaled 1:1 to 1280x720)
         surfaceView.setOnTouchListener((v, event) -> {
             int actionMasked = event.getActionMasked();
             int aapAction = 2; // DRAG
@@ -106,7 +104,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } else if (actionMasked == MotionEvent.ACTION_UP || actionMasked == MotionEvent.ACTION_CANCEL) {
                 aapAction = 1; // RELEASE
             }
-            NativeCore.sendTouch(aapAction, (int) event.getX(), (int) event.getY());
+            int viewW = v.getWidth();
+            int viewH = v.getHeight();
+            int touchX = (int) event.getX();
+            int touchY = (int) event.getY();
+            if (viewW > 0 && viewH > 0 && (viewW != 1280 || viewH != 720)) {
+                touchX = (int) (event.getX() * 1280f / viewW);
+                touchY = (int) (event.getY() * 720f / viewH);
+            }
+            NativeCore.sendTouch(aapAction, touchX, touchY);
             return true;
         });
 
@@ -128,6 +134,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // 3. Bluetooth Wakeup Poke Loop to S25 Ultra Audio Gateway (UUID 0000111f-...)
         startWakeupPokeLoop();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        hideSystemUI();
+    }
+
+    private void hideSystemUI() {
+        View decorView = getWindow().getDecorView();
+        decorView.setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        );
     }
 
     @Override
