@@ -225,12 +225,14 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
                         stream.set_nodelay(true).ok();
                         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
-                        // Optimize TCP receive buffer to 1MB and boost thread priority to realtime (-10)
+                        // Optimize TCP receive buffer to 2MB, enable QUICKACK, and boost thread priority to realtime (-16)
                         use std::os::unix::io::AsRawFd;
                         let fd = stream.as_raw_fd();
-                        let rcv_buf: c_int = 1024 * 1024;
-                        setsockopt(fd, 1, 8, &rcv_buf as *const _ as *const c_void, std::mem::size_of_val(&rcv_buf) as u32);
-                        setpriority(0, 0, -10);
+                        let rcv_buf: c_int = 2 * 1024 * 1024;
+                        let quickack: c_int = 1;
+                        setsockopt(fd, 1 /* SOL_SOCKET */, 8 /* SO_RCVBUF */, &rcv_buf as *const _ as *const c_void, std::mem::size_of_val(&rcv_buf) as u32);
+                        setsockopt(fd, 6 /* IPPROTO_TCP */, 12 /* TCP_QUICKACK */, &quickack as *const _ as *const c_void, std::mem::size_of_val(&quickack) as u32);
+                        setpriority(0, 0, -16);
 
                         // Instantiate hardware video decoder bound to native window
                         let mut decoder = HardwareVideoDecoder::new(window);
@@ -267,7 +269,10 @@ fn handle_aap_session(
     log_info("[AAP Session] Starting Session Handler...");
 
     let mut write_stream = match stream.try_clone() {
-        Ok(s) => s,
+        Ok(s) => {
+            s.set_nodelay(true).ok();
+            s
+        }
         Err(e) => {
             log_err(&format!("[AAP Session] try_clone failed: {}", e));
             return;
@@ -606,7 +611,7 @@ fn handle_aap_session(
                             // H.264 Video Stream Fragment (CSD or Media Data Access Unit)
                             if let Some(unit) = video_assembler.on_fragment(frame.flags, &frame.payload) {
                                 if let Some(dec) = decoder.as_mut() {
-                                    dec.feed_packet(&unit.data, unit.timestamp_us, unit.is_config);
+                                    dec.feed_packet(unit.data, unit.timestamp_us, unit.is_config);
                                 }
                                 if unit.completes_data {
                                     let ack = build_media_ack(video_session_id);

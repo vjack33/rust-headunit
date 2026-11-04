@@ -56,7 +56,7 @@ pub fn read_frame(
         let mut guard = tls.lock().unwrap();
         if let Some(ref mut conn) = *guard {
             let mut cursor = Cursor::new(&body);
-            let mut plain = Vec::new();
+            let mut plain = Vec::with_capacity(body.len());
 
             // Must loop read_tls until the entire AAP body (which may exceed a single read_tls buffer chunk) is consumed
             while (cursor.position() as usize) < body.len() {
@@ -157,11 +157,11 @@ pub fn write_frame(
     Ok(())
 }
 
-// Video Access Unit Assembler (Zero-copy H.264 stream reassembler)
-#[derive(Debug, Clone)]
-pub struct VideoAccessUnit {
+// Video Access Unit Assembler (Zero-allocation H.264 stream reassembler)
+#[derive(Debug)]
+pub struct VideoAccessUnit<'a> {
     pub is_config: bool,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
     pub completes_data: bool,
     pub timestamp_us: u64,
 }
@@ -183,7 +183,7 @@ impl VideoAssembler {
         }
     }
 
-    pub fn on_fragment(&mut self, flags: u8, payload: &[u8]) -> Option<VideoAccessUnit> {
+    pub fn on_fragment<'a>(&'a mut self, flags: u8, payload: &[u8]) -> Option<VideoAccessUnit<'a>> {
         let is_first = (flags & FLAG_FIRST) != 0;
         let is_last = (flags & FLAG_LAST) != 0;
 
@@ -208,10 +208,9 @@ impl VideoAssembler {
 
                 if is_last {
                     self.assembling = false;
-                    let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                     return Some(VideoAccessUnit {
                         is_config: false,
-                        data,
+                        data: &self.buffer,
                         completes_data: true,
                         timestamp_us: self.timestamp_us,
                     });
@@ -226,10 +225,9 @@ impl VideoAssembler {
 
                 if is_last {
                     self.assembling = false;
-                    let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                     return Some(VideoAccessUnit {
                         is_config: true,
-                        data,
+                        data: &self.buffer,
                         completes_data: false,
                         timestamp_us: 0,
                     });
@@ -252,10 +250,9 @@ impl VideoAssembler {
                 let is_cfg = self.current_type == 1;
                 let completes = self.current_type == 0;
                 let ts = self.timestamp_us;
-                let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                 return Some(VideoAccessUnit {
                     is_config: is_cfg,
-                    data,
+                    data: &self.buffer,
                     completes_data: completes,
                     timestamp_us: ts,
                 });

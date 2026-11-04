@@ -17,6 +17,7 @@ import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
@@ -159,6 +160,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         NativeCore.init();
         isRunning.set(true);
 
+        // Boost CPU & GPU hardware clocks for smooth 60 FPS presentation
+        boostPerformance();
+
         // Start periodic UI sync with native state
         uiHandler.post(uiSyncRunnable);
 
@@ -194,6 +198,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             | View.SYSTEM_UI_FLAG_FULLSCREEN
             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         );
+    }
+
+    private void boostPerformance() {
+        new Thread(() -> {
+            try {
+                // Boost CPU governor to performance (lock all 4 cores at 1.21 GHz) and Adreno GPU
+                Process p = Runtime.getRuntime().exec(new String[]{
+                    "su", "-c",
+                    "for c in /sys/devices/system/cpu/cpu[0-3]/cpufreq/scaling_governor; do echo performance > $c; done; " +
+                    "echo performance > /sys/class/kgsl/kgsl-3d0/devfreq/governor 2>/dev/null || true"
+                });
+                p.waitFor();
+                Log.i(TAG, "[PERF] Maximum CPU (1.21 GHz) & GPU (400 MHz) performance governors locked.");
+            } catch (Exception e) {
+                Log.w(TAG, "[PERF] Could not lock performance governors: " + e.getMessage());
+            }
+        }, "PerfBooster").start();
     }
 
     @Override

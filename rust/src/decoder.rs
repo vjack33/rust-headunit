@@ -126,7 +126,7 @@ impl HardwareVideoDecoder {
             .name("VenusOutput".to_string())
             .spawn(move || {
                 unsafe {
-                    setpriority(0, 0, -10); // Realtime display scheduling priority
+                    setpriority(0, 0, -16); // Highest realtime display scheduling priority
                     let codec_ptr = codec_usize as *mut c_void;
                     let mut info = AMediaCodecBufferInfo {
                         offset: 0,
@@ -136,7 +136,7 @@ impl HardwareVideoDecoder {
                     };
 
                     while running_clone.load(Ordering::Relaxed) {
-                        let out_idx = AMediaCodec_dequeueOutputBuffer(codec_ptr, &mut info, 5000); // 5ms timeout
+                        let out_idx = AMediaCodec_dequeueOutputBuffer(codec_ptr, &mut info, 2000); // 2ms timeout
                         if out_idx >= 0 {
                             AMediaCodec_releaseOutputBuffer(codec_ptr, out_idx as usize, true);
                             let total = count_clone.fetch_add(1, Ordering::Relaxed) + 1;
@@ -177,9 +177,9 @@ impl HardwareVideoDecoder {
         }
 
         unsafe {
-            let mut in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 10000); // 10ms timeout
+            let mut in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 1000); // 1ms non-blocking
             if in_idx < 0 {
-                in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 5000);
+                in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 1000);
             }
             if in_idx >= 0 {
                 let mut out_size: usize = 0;
