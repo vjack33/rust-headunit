@@ -38,12 +38,11 @@ pub fn read_frame(
     let flags = header[1];
     let len = u16::from_be_bytes([header[2], header[3]]) as usize;
 
-    // Andre Knieriem open-headunit framing rule:
-    // When AapMessageFraming.carriesTotalLength(flags) is true (FIRST without LAST),
-    // a 4-byte big-endian total_plaintext_length is prepended immediately following the 4-byte header!
+    let mut _declared_total = None;
     if (flags & FLAG_FIRST != 0) && (flags & FLAG_LAST == 0) {
         let mut total_len_buf = [0u8; 4];
         stream.read_exact(&mut total_len_buf)?;
+        _declared_total = Some(u32::from_be_bytes(total_len_buf));
     }
 
     let mut body = vec![0u8; len];
@@ -54,12 +53,52 @@ pub fn read_frame(
     if (flags & FLAG_ENCRYPTED) != 0 {
         if let Some(ref mut conn) = tls {
             let mut cursor = Cursor::new(&body);
-            conn.read_tls(&mut cursor)?;
-            conn.process_new_packets()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
             let mut plain = Vec::new();
-            let _ = conn.reader().read_to_end(&mut plain);
+
+            // Must loop read_tls until the entire AAP body (which may exceed a single read_tls buffer chunk) is consumed
+            while (cursor.position() as usize) < body.len() {
+                let n = conn.read_tls(&mut cursor)?;
+                let io_state = match conn.process_new_packets() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_err(&format!(
+                            "[read_frame] process_new_packets error: {} (hdr={:02X?}, body_len={}, cursor_pos={}, body_preview={:02X?})",
+                            e, header, body.len(), cursor.position(), &body[..std::cmp::min(body.len(), 32)]
+                        ));
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                    }
+                };
+
+                if io_state.plaintext_bytes_to_read() > 0 {
+                    let _ = conn.reader().read_to_end(&mut plain);
+                }
+
+                if n == 0 {
+                    break;
+                }
+            }
+
+            // Final drain for any remaining decrypted plaintext in rustls
+            let io_state = match conn.process_new_packets() {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::log_err(&format!(
+                        "[read_frame] final process_new_packets error: {} (hdr={:02X?}, body_len={})",
+                        e, header, body.len()
+                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                }
+            };
+            if io_state.plaintext_bytes_to_read() > 0 {
+                let _ = conn.reader().read_to_end(&mut plain);
+            }
+
+            if plain.is_empty() && len > 0 {
+                crate::log_info(&format!(
+                    "[read_frame] Encrypted frame produced 0 plaintext bytes (chan={}, wire_flags=0x{:02X}, enc_len={}, cursor_pos={}/{}, body_preview={:02X?})",
+                    channel, flags, len, cursor.position(), body.len(), &body[..std::cmp::min(body.len(), 16)]
+                ));
+            }
 
             return Ok(AapFrame {
                 channel,
@@ -84,6 +123,15 @@ pub fn write_frame(
     payload: &[u8],
     encrypt: bool,
 ) -> std::io::Result<()> {
+    // AAP Protocol framing rule (matching open-headunit AapMessage.kt):
+    // Any control message (type 1..=26) sent on non-zero channels MUST carry FLAG_CONTROL (0x04)
+    if channel != ID_CTR && payload.len() >= 2 {
+        let msg_type = u16::from_be_bytes([payload[0], payload[1]]);
+        if msg_type >= 1 && msg_type <= 26 {
+            flags |= FLAG_CONTROL;
+        }
+    }
+
     if encrypt {
         if let Some(ref mut conn) = tls {
             conn.writer().write_all(payload)?;
@@ -92,20 +140,22 @@ pub fn write_frame(
 
             flags |= FLAG_ENCRYPTED;
             let len = cipher.len() as u16;
-            let header = [channel, flags, (len >> 8) as u8, len as u8];
-            stream.write_all(&header)?;
-            stream.write_all(&cipher)?;
+            let mut frame_buf = Vec::with_capacity(4 + cipher.len());
+            frame_buf.extend_from_slice(&[channel, flags, (len >> 8) as u8, len as u8]);
+            frame_buf.extend_from_slice(&cipher);
+            stream.write_all(&frame_buf)?;
             stream.flush()?;
             return Ok(());
         }
     }
 
     let len = payload.len() as u16;
-    let header = [channel, flags, (len >> 8) as u8, len as u8];
-    stream.write_all(&header)?;
+    let mut frame_buf = Vec::with_capacity(4 + payload.len());
+    frame_buf.extend_from_slice(&[channel, flags, (len >> 8) as u8, len as u8]);
     if !payload.is_empty() {
-        stream.write_all(payload)?;
+        frame_buf.extend_from_slice(payload);
     }
+    stream.write_all(&frame_buf)?;
     stream.flush()?;
     Ok(())
 }
@@ -380,7 +430,7 @@ pub fn build_service_discovery_response() -> Vec<u8> {
 pub fn build_media_config_response(max_unacked: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&[0x80, 0x03]); // MEDIA_MESSAGE_CONFIG type
-    encode_uint32(1, 0, &mut out); // status = STATUS_READY (0)
+    encode_uint32(1, 2, &mut out); // status = STATUS_READY (2) [Media.proto ConfigStatus: STATUS_WAIT=1, STATUS_READY=2]
     encode_uint32(2, max_unacked, &mut out); // max_unacked
     encode_uint32(3, 0, &mut out); // configuration_indices = 0
     out

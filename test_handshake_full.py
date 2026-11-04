@@ -14,10 +14,11 @@ def recv_exact(s, n):
     return bytes(buf)
 
 def main():
-    print("Connecting to Headunit at 127.0.0.1:5277...")
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5288
+    print(f"Connecting to Headunit at 127.0.0.1:{port}...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect(("127.0.0.1", 5277))
-    print("[1] Connected to Headunit TCP port 5277!")
+    s.connect(("127.0.0.1", port))
+    print(f"[1] Connected to Headunit TCP port {port}!")
 
     # 1. Read Version Request from Headunit
     # Headunit sends: [chan(0), flags(3), len(6), type(1), major(1), minor(2)]

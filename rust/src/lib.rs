@@ -66,20 +66,40 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
     (a as u32) << 24 | (b as u32) << 16 | (g as u32) << 8 | (r as u32)
 }
 
+#[derive(Debug)]
+struct CustomClientCertResolver(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for CustomClientCertResolver {
+    fn resolve(
+        &self,
+        _acceptable_issuers: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 fn create_tls_client() -> Result<ClientConnection, Box<dyn std::error::Error>> {
     let cert_der = CertificateDer::from_pem_slice(cert::CERTIFICATE.as_bytes())?;
     let key_der = PrivateKeyDer::from_pem_slice(cert::PRIVATE_KEY.as_bytes())?;
 
-    let mut root_store = rustls::RootCertStore::empty();
-    if let Ok(ca_der) = CertificateDer::from_pem_slice(cert::AAUTO_CERT.as_bytes()) {
-        root_store.add(ca_der).ok();
-    }
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider.key_provider.load_private_key(key_der)?;
 
-    let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let certified_key = Arc::new(rustls::sign::CertifiedKey {
+        cert: vec![cert_der],
+        key: signing_key,
+        ocsp: None,
+    });
+
+    let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AndroidAutoServerVerifier))
-        .with_client_auth_cert(vec![cert_der], key_der)?;
+        .with_client_cert_resolver(Arc::new(CustomClientCertResolver(certified_key)));
 
     let server_name = ServerName::try_from("androidauto")?;
     let conn = ClientConnection::new(Arc::new(config), server_name)?;
@@ -145,7 +165,6 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
         thread::spawn(move || {
             let window = window_ptr as *mut c_void;
             let addr = format!("0.0.0.0:{}", tcp_port);
-
             let listener = match TcpListener::bind(&addr) {
                 Ok(l) => {
                     log_info(&format!("[AAP Server] Listening for phone connection on {}", addr));
@@ -154,6 +173,7 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
                 }
                 Err(e) => {
                     log_err(&format!("[AAP Server] Failed to bind to {}: {}", addr, e));
+                    ANativeWindow_release(window);
                     return;
                 }
             };
@@ -164,9 +184,10 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
             while IS_RUNNING.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, client_addr)) => {
-                        log_info(&format!("[AAP Server] Phone connected from: {}", client_addr));
+                        let local_p = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+                        log_info(&format!("[AAP Server] Phone connected from: {} (local port: {})", client_addr, local_p));
                         stream.set_nodelay(true).ok();
-                        stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
                         // Instantiate hardware video decoder bound to native window
                         let mut decoder = HardwareVideoDecoder::new(window);
@@ -198,25 +219,88 @@ fn handle_aap_session(
     decoder: &mut Option<HardwareVideoDecoder>,
     audio_sink: &mut Option<NativeAudioSink>,
 ) {
-    log_info("[AAP Session] Starting Version Handshake (v1.2)...");
+    log_info("[AAP Session] Starting Session Handler...");
 
-    // 1. Send VERSION_REQUEST: Channel 0, type 0x0001, major=1, minor=2
-    let ver_req = [0x00, 0x01, 0x00, 0x01, 0x00, 0x02];
-    if let Err(e) = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &ver_req, false) {
-        log_err(&format!("[AAP Session] Failed to send VersionRequest: {}", e));
-        return;
-    }
-
-    // 2. Read VERSION_RESPONSE
-    let mut tls: Option<ClientConnection> = None;
-    match read_frame(stream, &mut tls) {
-        Ok(frame) => {
-            log_info(&format!("[AAP Session] Received Version Response, len={}", frame.payload.len()));
+    // Check if phone sent any initial bytes (peek non-blocking)
+    stream.set_nonblocking(true).ok();
+    let mut peek_buf = [0u8; 64];
+    match stream.peek(&mut peek_buf) {
+        Ok(n) if n > 0 => {
+            log_info(&format!(
+                "[AAP Session] Phone sent {} initial bytes before VersionRequest: {:02X?}",
+                n, &peek_buf[..n]
+            ));
         }
-        Err(e) => {
-            log_err(&format!("[AAP Session] Failed to read Version Response: {}", e));
+        _ => {}
+    }
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(Duration::from_millis(2000))).ok();
+
+    // 1. Send VERSION_REQUEST with retries matching open-headunit
+    let ver_req = [0x00, 0x01, 0x00, 0x01, 0x00, 0x02];
+    let mut ver_resp = None;
+
+    for attempt in 1..=4 {
+        log_info(&format!("[AAP Session] Sending Version Request (1.2) [attempt {}/4]...", attempt));
+        if let Err(e) = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &ver_req, false) {
+            log_err(&format!("[AAP Session] Failed to send VersionRequest: {}", e));
             return;
         }
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        while std::time::Instant::now() < deadline {
+            match read_frame(stream, &mut None) {
+                Ok(f) => {
+                    log_info(&format!(
+                        "[AAP Session] Received frame: chan={}, flags=0x{:02X}, len={}",
+                        f.channel, f.flags, f.payload.len()
+                    ));
+                    if f.channel == ID_CTR && f.payload.len() >= 6 {
+                        let msg_type = u16::from_be_bytes([f.payload[0], f.payload[1]]);
+                        if msg_type == 0x0002 {
+                            ver_resp = Some(f);
+                            break;
+                        }
+                    }
+                    log_info("[AAP Session] Ignoring unexpected message while waiting for VERSION_RESPONSE");
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    log_info("[AAP Session] Read timeout waiting for VERSION_RESPONSE, will retry...");
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log_err("[AAP Session] Phone closed TCP socket during version handshake");
+                    return;
+                }
+                Err(e) => {
+                    log_err(&format!("[AAP Session] Read error: {}", e));
+                    return;
+                }
+            }
+        }
+
+        if ver_resp.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let ver_resp = match ver_resp {
+        Some(f) => f,
+        None => {
+            log_err("[AAP Session] Version exchange failed after 4 attempts.");
+            return;
+        }
+    };
+
+    if ver_resp.payload.len() >= 6 {
+        let msg_type = u16::from_be_bytes([ver_resp.payload[0], ver_resp.payload[1]]);
+        let major = u16::from_be_bytes([ver_resp.payload[2], ver_resp.payload[3]]);
+        let minor = u16::from_be_bytes([ver_resp.payload[4], ver_resp.payload[5]]);
+        log_info(&format!(
+            "[AAP Session] Phone AAP version negotiated: type=0x{:04X}, version={}.{}",
+            msg_type, major, minor
+        ));
     }
 
     // 3. Setup TLS Client
@@ -246,9 +330,13 @@ fn handle_aap_session(
 
     // Loop through SSL Handshake
     let mut hs_completed = false;
-    for _ in 0..15 {
+    for step in 0..20 {
         match read_frame(stream, &mut None) {
             Ok(f) => {
+                log_info(&format!(
+                    "[AAP Session] TLS step {}: received frame chan={}, flags=0x{:02X}, len={}",
+                    step, f.channel, f.flags, f.payload.len()
+                ));
                 if f.channel == ID_CTR && f.payload.len() >= 2 && f.payload[0] == 0x00 && f.payload[1] == 0x03 {
                     let mut cursor = Cursor::new(&f.payload[2..]);
                     if let Err(e) = tls_client.read_tls(&mut cursor) {
@@ -260,19 +348,24 @@ fn handle_aap_session(
                         break;
                     }
 
-                    if !tls_client.is_handshaking() {
-                        hs_completed = true;
-                        log_info("[AAP Session] TLS Handshake Successful!");
-                        break;
+                    let mut next_data = Vec::new();
+                    while let Ok(n) = tls_client.write_tls(&mut next_data) {
+                        if n == 0 { break; }
+                    }
+                    if !next_data.is_empty() {
+                        let mut next_frame = vec![0x00, 0x03];
+                        next_frame.extend(next_data);
+                        let _ = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &next_frame, false);
                     }
 
-                    let mut next_data = Vec::new();
-                    if let Ok(n) = tls_client.write_tls(&mut next_data) {
-                        if n > 0 {
-                            let mut next_frame = vec![0x00, 0x03];
-                            next_frame.extend(next_data);
-                            let _ = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &next_frame, false);
-                        }
+                    if !tls_client.is_handshaking() {
+                        hs_completed = true;
+                        log_info(&format!(
+                            "[AAP Session] TLS Handshake Successful! (version={:?}, cipher_suite={:?})",
+                            tls_client.protocol_version(),
+                            tls_client.negotiated_cipher_suite()
+                        ));
+                        break;
                     }
                 }
             }
@@ -318,6 +411,29 @@ fn handle_aap_session(
             Ok(frame) => {
                 let channel = frame.channel;
                 let data = &frame.payload;
+                let msg_type = if data.len() >= 2 {
+                    u16::from_be_bytes([data[0], data[1]])
+                } else {
+                    0xFFFF
+                };
+                log_info(&format!(
+                    "[AAP RX] chan={}, flags=0x{:02X}, len={}, msg_type=0x{:04X}",
+                    channel, frame.flags, data.len(), msg_type
+                ));
+
+                if msg_type == 0x000B {
+                    // PING_REQUEST -> PING_RESPONSE (respond immediately on any channel)
+                    let ping_payload = if data.len() >= 2 { &data[2..] } else { &[] };
+                    let ping_resp = build_ping_response(ping_payload);
+                    let _ = write_frame(stream, &mut active_tls, channel, FLAG_SINGLE, &ping_resp, true);
+                    continue;
+                }
+
+                if data.is_empty() {
+                    // Empty plaintext frame (e.g. TLS post-handshake control record / NewSessionTicket)
+                    log_info(&format!("[AAP RX] Ignored empty plaintext frame on channel {}", channel));
+                    continue;
+                }
 
                 match channel {
                     ID_CTR => {
@@ -364,9 +480,11 @@ fn handle_aap_session(
                             match msg_type {
                                 0x0007 => {
                                     // CHANNEL_OPEN_REQUEST
-                                    log_info("[AAP Session] Sensor Channel Open Request -> OK");
+                                    log_info("[AAP Session] Sensor Channel Open Request -> OK (sending OpenResponse & DrivingStatus UNRESTRICTED)");
                                     let resp = build_channel_open_response();
                                     let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &resp, true);
+                                    let ds = build_sensor_driving_status();
+                                    let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &ds, true);
                                 }
                                 0x8001 => {
                                     // SENSOR_STARTREQUEST -> SENSOR_STARTRESPONSE + SENSOR_EVENT (driving_status UNRESTRICTED)
@@ -384,7 +502,7 @@ fn handle_aap_session(
                         // Channel 2: Video Channel (open-headunit Channel.ID_VID)
                         let is_first = (frame.flags & FLAG_FIRST) != 0;
                         let is_ctrl = (frame.flags & FLAG_CONTROL != 0)
-                            || (is_first && data.len() >= 2 && matches!(u16::from_be_bytes([data[0], data[1]]), 0x0007 | 0x8000 | 0x8001 | 0x8002));
+                            || (is_first && data.len() >= 2 && matches!(u16::from_be_bytes([data[0], data[1]]), 0x0007 | 0x8000 | 0x8001 | 0x8002 | 0x8007));
 
                         if is_ctrl && data.len() >= 2 {
                             let ctrl_type = u16::from_be_bytes([data[0], data[1]]);
@@ -405,7 +523,7 @@ fn handle_aap_session(
                                 }
                                 0x8001 => {
                                     // MEDIA_MESSAGE_START
-                                    if data.len() >= 4 {
+                                    if data.len() >= 4 && data[2] == 0x08 {
                                         video_session_id = data[3] as i32;
                                     }
                                     log_info(&format!("[AAP Session] >>> VIDEO STREAM STARTED (session_id={}) <<<", video_session_id));
@@ -413,6 +531,10 @@ fn handle_aap_session(
                                 0x8002 => {
                                     // MEDIA_MESSAGE_STOP
                                     log_info("[AAP Session] Video Stream Stopped by phone");
+                                }
+                                0x8007 => {
+                                    // MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST (informational - focus was already granted at setup)
+                                    log_info("[AAP Session] Video Focus Request received from phone");
                                 }
                                 _ => {}
                             }
@@ -525,4 +647,14 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_stopEngine(
     log_info("Stopping Rust Native Headunit Core...");
     IS_RUNNING.store(false, Ordering::SeqCst);
     IS_PROJECTING.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_tls_client() {
+        assert!(create_tls_client().is_ok());
+    }
 }

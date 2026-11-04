@@ -86,6 +86,8 @@ impl HardwareVideoDecoder {
             AMediaFormat_setString(format, key_mime.as_ptr(), mime.as_ptr());
             AMediaFormat_setInt32(format, key_width.as_ptr(), 1280);
             AMediaFormat_setInt32(format, key_height.as_ptr(), 720);
+            let key_max_input = CString::new("max-input-size").unwrap();
+            AMediaFormat_setInt32(format, key_max_input.as_ptr(), 1048576); // 1MB buffer
 
             // Configure codec with ANativeWindow for zero-copy direct surface rendering
             let res = AMediaCodec_configure(codec, format, native_window, std::ptr::null_mut(), 0);
@@ -118,7 +120,10 @@ impl HardwareVideoDecoder {
         }
 
         unsafe {
-            let in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 5000); // 5ms timeout
+            let mut in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 10000); // 10ms timeout
+            if in_idx < 0 {
+                in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 10000);
+            }
             if in_idx >= 0 {
                 let mut out_size: usize = 0;
                 let in_ptr = AMediaCodec_getInputBuffer(self.codec, in_idx as usize, &mut out_size);
@@ -166,6 +171,14 @@ impl HardwareVideoDecoder {
                     AMediaCodec_releaseOutputBuffer(self.codec, out_idx as usize, true);
                     self.frame_count += 1;
                     log(&format!("[Decoder] Rendered frame #{} on ANativeWindow", self.frame_count));
+                } else if out_idx == -2 {
+                    // AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED
+                    log("[Decoder] AMediaCodec output format changed");
+                    continue;
+                } else if out_idx == -3 {
+                    // AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED
+                    log("[Decoder] AMediaCodec output buffers changed");
+                    continue;
                 } else {
                     break;
                 }
