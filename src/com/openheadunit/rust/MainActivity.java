@@ -16,14 +16,26 @@ import android.net.wifi.p2p.WifiP2pConfig;
 import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -61,6 +73,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private final AtomicBoolean isHfpConnected = new AtomicBoolean(false);
     private final AtomicBoolean hasPoked = new AtomicBoolean(false);
 
+    // UI Progress & Status Components
+    private FrameLayout rootLayout;
+    private View overlayView;
+    private TextView tvMainStatus;
+    private TextView tvSubStatus;
+    private TextView tvStepWifi;
+    private TextView tvStepBt;
+    private TextView tvStepWpp;
+    private TextView tvStepAap;
+    private TextView tvLastLog;
+    private TextView tvBadge;
+    private TextView tvBottomInfo;
+    private ProgressBar progressBar;
+    private Button btnWakeNow;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private volatile boolean isOverlayHidden = false;
+
     private BluetoothServerSocket aaServerSocket;
     private BluetoothServerSocket hfpServerSocket;
     private BluetoothSocket activeHfpSocket;
@@ -90,10 +119,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Pin the Surface buffer to the exact video resolution so SurfaceFlinger
         // composites at 1:1 pixel ratio — prevents DPI-scaled cropping on hdpi displays.
         surfaceView.getHolder().setFixedSize(1280, 720);
-        setContentView(surfaceView,
-            new android.widget.FrameLayout.LayoutParams(
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
+
+        rootLayout = new FrameLayout(this);
+        rootLayout.addView(surfaceView,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
+        overlayView = buildOverlayView();
+        rootLayout.addView(overlayView,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
+        setContentView(rootLayout);
 
         // Touch forwarding to Rust Native Input Channel (scaled 1:1 to 1280x720)
         surfaceView.setOnTouchListener((v, event) -> {
@@ -119,6 +158,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Initialize Native Rust Core
         NativeCore.init();
         isRunning.set(true);
+
+        // Start periodic UI sync with native state
+        uiHandler.post(uiSyncRunnable);
 
         // Register mDNS/NSD service _aawireless._tcp on port 5288
         registerNsd();
@@ -173,6 +215,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onDestroy() {
         super.onDestroy();
         isRunning.set(false);
+        uiHandler.removeCallbacksAndMessages(null);
         unregisterNsd();
         unregisterP2pReceiver();
         if (p2pManager != null && p2pChannel != null) {
@@ -183,6 +226,355 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         closeQuietly(aaServerSocket);
         closeQuietly(hfpServerSocket);
         closeQuietly(activeHfpSocket);
+    }
+
+    private View buildOverlayView() {
+        FrameLayout container = new FrameLayout(this);
+        container.setBackgroundColor(Color.parseColor("#EE0B0F19")); // Sleek dark slate backdrop
+
+        // Center card wrapper
+        LinearLayout centerCard = new LinearLayout(this);
+        centerCard.setOrientation(LinearLayout.VERTICAL);
+        centerCard.setGravity(Gravity.CENTER_HORIZONTAL);
+        centerCard.setBackground(makeRoundedDrawable(Color.parseColor("#161F30"), Color.parseColor("#22334F"), dp(1), dp(16)));
+        centerCard.setPadding(dp(28), dp(16), dp(28), dp(16));
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
+            dp(560),
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        );
+        cardLp.gravity = Gravity.CENTER;
+        centerCard.setLayoutParams(cardLp);
+
+        // Header inside card
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams headerLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        headerRow.setLayoutParams(headerLp);
+
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams titleColLp = new LinearLayout.LayoutParams(
+            0,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            1.0f
+        );
+        titleCol.setLayoutParams(titleColLp);
+
+        TextView tvTitle = new TextView(this);
+        tvTitle.setText("OPEN HEADUNIT RUST");
+        tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        tvTitle.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        tvTitle.setTextColor(Color.parseColor("#38BDF8"));
+        titleCol.addView(tvTitle);
+
+        TextView tvSubtitle = new TextView(this);
+        tvSubtitle.setText("Android Auto Wireless • MSM8916 Snapdragon 410");
+        tvSubtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tvSubtitle.setTextColor(Color.parseColor("#64748B"));
+        titleCol.addView(tvSubtitle);
+
+        headerRow.addView(titleCol);
+
+        tvBadge = new TextView(this);
+        tvBadge.setText("INITIALIZING");
+        tvBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        tvBadge.setTypeface(Typeface.DEFAULT_BOLD);
+        tvBadge.setTextColor(Color.parseColor("#38BDF8"));
+        tvBadge.setPadding(dp(10), dp(4), dp(10), dp(4));
+        tvBadge.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#38BDF8"), dp(1), dp(12)));
+        headerRow.addView(tvBadge);
+
+        centerCard.addView(headerRow);
+
+        // Divider
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.parseColor("#1E293B"));
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(1)
+        );
+        divLp.setMargins(0, dp(14), 0, dp(14));
+        centerCard.addView(divider, divLp);
+
+        // Spinner + Main Status
+        progressBar = new ProgressBar(this);
+        LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(dp(36), dp(36));
+        pbLp.gravity = Gravity.CENTER_HORIZONTAL;
+        pbLp.setMargins(0, 0, 0, dp(10));
+        centerCard.addView(progressBar, pbLp);
+
+        tvMainStatus = new TextView(this);
+        tvMainStatus.setText("Waiting for S25 Ultra...");
+        tvMainStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        tvMainStatus.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        tvMainStatus.setTextColor(Color.parseColor("#F8FAFC"));
+        tvMainStatus.setGravity(Gravity.CENTER);
+        centerCard.addView(tvMainStatus);
+
+        tvSubStatus = new TextView(this);
+        tvSubStatus.setText("Starting Wi-Fi Direct and listening for Bluetooth triggers...");
+        tvSubStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tvSubStatus.setTextColor(Color.parseColor("#94A3B8"));
+        tvSubStatus.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        subLp.setMargins(0, dp(4), 0, dp(14));
+        centerCard.addView(tvSubStatus, subLp);
+
+        // 4-Step Checklist container
+        LinearLayout stepBox = new LinearLayout(this);
+        stepBox.setOrientation(LinearLayout.VERTICAL);
+        stepBox.setBackground(makeRoundedDrawable(Color.parseColor("#0F172A"), Color.parseColor("#1E293B"), dp(1), dp(8)));
+        stepBox.setPadding(dp(14), dp(10), dp(14), dp(10));
+
+        tvStepWifi = createStepTextView("● Wi-Fi Direct: Initializing...");
+        tvStepBt   = createStepTextView("● Bluetooth Poke: Ready");
+        tvStepWpp  = createStepTextView("● WPP Handshake: Waiting for phone...");
+        tvStepAap  = createStepTextView("● AAP Stream: Port " + AAP_PORT + " listening...");
+
+        stepBox.addView(tvStepWifi);
+        stepBox.addView(tvStepBt);
+        stepBox.addView(tvStepWpp);
+        stepBox.addView(tvStepAap);
+        centerCard.addView(stepBox);
+
+        // Action Button
+        btnWakeNow = new Button(this);
+        btnWakeNow.setText("⚡ Wake Phone Now");
+        btnWakeNow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        btnWakeNow.setTypeface(Typeface.DEFAULT_BOLD);
+        btnWakeNow.setTextColor(Color.WHITE);
+        btnWakeNow.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), 0, 0, dp(8)));
+        btnWakeNow.setPadding(dp(20), dp(10), dp(20), dp(10));
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        btnLp.gravity = Gravity.CENTER_HORIZONTAL;
+        btnLp.setMargins(0, dp(14), 0, dp(8));
+        btnWakeNow.setLayoutParams(btnLp);
+        btnWakeNow.setOnClickListener(v -> {
+            btnWakeNow.setEnabled(false);
+            btnWakeNow.setText("⚡ Waking...");
+            pokeOnce();
+            uiHandler.postDelayed(() -> {
+                btnWakeNow.setEnabled(true);
+                btnWakeNow.setText("⚡ Wake Phone Now");
+            }, 3500);
+        });
+        centerCard.addView(btnWakeNow);
+
+        // Last log line
+        tvLastLog = new TextView(this);
+        tvLastLog.setText("Service initialized, listening on RFCOMM");
+        tvLastLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        tvLastLog.setTypeface(Typeface.MONOSPACE);
+        tvLastLog.setTextColor(Color.parseColor("#64748B"));
+        tvLastLog.setGravity(Gravity.CENTER);
+        centerCard.addView(tvLastLog);
+
+        // Network / Engine Info
+        tvBottomInfo = new TextView(this);
+        tvBottomInfo.setText("SSID: " + p2pSsid + " | Port: " + AAP_PORT + " | Venus HW Decoder (1280x720)");
+        tvBottomInfo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        tvBottomInfo.setTypeface(Typeface.MONOSPACE);
+        tvBottomInfo.setTextColor(Color.parseColor("#475569"));
+        tvBottomInfo.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams botLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        botLp.setMargins(0, dp(6), 0, 0);
+        centerCard.addView(tvBottomInfo, botLp);
+
+        container.addView(centerCard);
+
+        return container;
+    }
+
+    private TextView createStepTextView(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tv.setTypeface(Typeface.MONOSPACE);
+        tv.setTextColor(Color.parseColor("#94A3B8"));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        lp.setMargins(0, dp(2), 0, dp(2));
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    private static GradientDrawable makeRoundedDrawable(int fillColor, int strokeColor, int strokeWidth, float cornerRadius) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.RECTANGLE);
+        gd.setColor(fillColor);
+        if (strokeWidth > 0 && strokeColor != 0) {
+            gd.setStroke(strokeWidth, strokeColor);
+        }
+        gd.setCornerRadius(cornerRadius);
+        return gd;
+    }
+
+    private int dp(int val) {
+        return (int) (val * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private void setStatus(String main, String sub, String badge, int badgeColor) {
+        uiHandler.post(() -> {
+            if (tvMainStatus != null && main != null) tvMainStatus.setText(main);
+            if (tvSubStatus != null && sub != null) tvSubStatus.setText(sub);
+            if (tvBadge != null && badge != null) {
+                tvBadge.setText(badge);
+                tvBadge.setTextColor(badgeColor);
+                tvBadge.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), badgeColor, dp(1), dp(12)));
+            }
+        });
+    }
+
+    private void updateStep(TextView tv, String text, int color) {
+        uiHandler.post(() -> {
+            if (tv != null) {
+                tv.setText(text);
+                tv.setTextColor(color);
+            }
+        });
+    }
+
+    private void addLog(String msg) {
+        uiHandler.post(() -> {
+            if (tvLastLog != null) {
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US);
+                String time = sdf.format(new java.util.Date());
+                tvLastLog.setText("[" + time + "] " + msg);
+            }
+        });
+    }
+
+    private void updateBottomInfo() {
+        uiHandler.post(() -> {
+            if (tvBottomInfo != null) {
+                tvBottomInfo.setText("SSID: " + p2pSsid + " | Pass: " + p2pPass + " | Port: " + AAP_PORT + " | Venus HW Decoder");
+            }
+        });
+    }
+
+    private int lastReportedState = -1;
+
+    private final Runnable uiSyncRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning.get()) return;
+            try {
+                int state = NativeCore.getSessionState();
+                boolean projecting = NativeCore.isProjecting();
+                long frames = NativeCore.getRenderedFrames();
+
+                if (projecting || state == 4) {
+                    if (!isOverlayHidden) {
+                        isOverlayHidden = true;
+                        Log.i(TAG, "[UI] Video projecting! Fading out connection overlay (frames=" + frames + ")");
+                        overlayView.animate()
+                            .alpha(0f)
+                            .setDuration(400)
+                            .withEndAction(() -> overlayView.setVisibility(View.GONE));
+                    }
+                } else {
+                    if (isOverlayHidden) {
+                        isOverlayHidden = false;
+                        Log.i(TAG, "[UI] Projection ended, restoring connection overlay");
+                        overlayView.setVisibility(View.VISIBLE);
+                        overlayView.setAlpha(0f);
+                        overlayView.animate().alpha(1f).setDuration(300);
+                    }
+
+                    if (state != lastReportedState) {
+                        lastReportedState = state;
+                        if (state == 1) { // TCP_CONNECTED
+                            setStatus("Phone Connected (TCP)!", "Establishing encrypted AAP channel...", "TCP CONNECTED", Color.parseColor("#38BDF8"));
+                            updateStep(tvStepAap, "✓ TCP: Connected on port " + AAP_PORT, Color.parseColor("#4ADE80"));
+                            addLog("TCP connection established from phone");
+                        } else if (state == 2) { // TLS_HANDSHAKE
+                            setStatus("Securing Connection...", "Negotiating TLS cryptographic certificates...", "TLS HANDSHAKE", Color.parseColor("#FBBF24"));
+                            updateStep(tvStepAap, "● TLS: Exchanging certificates...", Color.parseColor("#FBBF24"));
+                            addLog("TLS handshake in progress...");
+                        } else if (state == 3) { // PROTOCOL_SETUP
+                            setStatus("Starting Projection...", "Configuring video stream & touch channels...", "PROTOCOL SETUP", Color.parseColor("#A855F7"));
+                            updateStep(tvStepAap, "● AAP: Configuring 1280x720 video...", Color.parseColor("#A855F7"));
+                            addLog("AAP Protocol Setup / Service Discovery");
+                        } else if (state == 5) { // DISCONNECTED
+                            setStatus("Session Disconnected", "Waiting for phone reconnection...", "DISCONNECTED", Color.parseColor("#F87171"));
+                            updateStep(tvStepAap, "○ AAP Stream: Disconnected", Color.parseColor("#94A3B8"));
+                            addLog("AAP Session disconnected");
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "uiSyncRunnable error: " + t.getMessage());
+            }
+            uiHandler.postDelayed(this, 250);
+        }
+    };
+
+    private void pokeOnce() {
+        new Thread(() -> {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null || !adapter.isEnabled()) {
+                setStatus("Bluetooth Disabled", "Please enable Bluetooth", "BT ERROR", Color.parseColor("#EF4444"));
+                addLog("Poke failed: Bluetooth is off");
+                return;
+            }
+            uiHandler.post(() -> {
+                updateStep(tvStepBt, "● Poking phone via Bluetooth...", Color.parseColor("#FBBF24"));
+                setStatus("Waking Phone...", "Sending HFP wakeup poke to S25 Ultra...", "WAKING", Color.parseColor("#FBBF24"));
+                addLog("Sending HFP wakeup poke...");
+            });
+
+            boolean found = false;
+            for (BluetoothDevice dev : adapter.getBondedDevices()) {
+                if (S25_MAC.equalsIgnoreCase(dev.getAddress()) || (dev.getName() != null && dev.getName().contains("S25 Ultra"))) {
+                    found = true;
+                    try {
+                        Log.i(TAG, "[POKE] Poking " + dev.getName() + " on HFP-AG (" + HFP_AG_UUID + ")...");
+                        BluetoothSocket pokeSocket = dev.createRfcommSocketToServiceRecord(HFP_AG_UUID);
+                        pokeSocket.connect();
+                        Log.i(TAG, "[POKE SUCCESS] Connected to S25 Ultra Audio Gateway! Holding 2.5s...");
+                        uiHandler.post(() -> {
+                            updateStep(tvStepBt, "✓ Poke ACK: S25 Ultra Audio Gateway reached", Color.parseColor("#4ADE80"));
+                            addLog("Wake poke delivered to S25 Ultra");
+                        });
+                        Thread.sleep(2500);
+                        pokeSocket.close();
+                        Log.i(TAG, "[POKE] Released poke socket, waiting for phone incoming connection...");
+                        uiHandler.post(() -> {
+                            setStatus("Waiting for Phone...", "Wake signal sent, waiting for phone to initiate connection...", "WAITING", Color.parseColor("#38BDF8"));
+                        });
+                    } catch (Exception e) {
+                        Log.d(TAG, "[POKE INFO] Connect attempt: " + e.getMessage());
+                        uiHandler.post(() -> {
+                            updateStep(tvStepBt, "○ Poke sent (waiting for response)", Color.parseColor("#94A3B8"));
+                            addLog("Poke sent (" + e.getMessage() + ")");
+                        });
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                uiHandler.post(() -> {
+                    setStatus("S25 Ultra Not Paired", "Pair phone in Bluetooth settings", "NOT PAIRED", Color.parseColor("#EF4444"));
+                    addLog("S25 Ultra not found in bonded devices");
+                });
+            }
+        }, "PokeThread").start();
     }
 
     private void registerNsd() {
@@ -292,6 +684,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             }
                             p2pBssid = getP2pMac();
                             Log.i(TAG, "[P2P LIVE GROUP] SSID=" + p2pSsid + " Pass=" + p2pPass + " BSSID=" + p2pBssid + " Iface=" + group.getInterface());
+                            updateStep(tvStepWifi, "✓ Wi-Fi Direct: " + p2pSsid + " (Active)", Color.parseColor("#4ADE80"));
+                            updateBottomInfo();
+                            addLog("Wi-Fi Direct ready (" + p2pSsid + ")");
                         }
                     });
                 }
@@ -455,6 +850,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             Log.i(TAG, "[AA-SERVER INCOMING] Phone connected via RFCOMM: " 
                                 + socket.getRemoteDevice().getName() + " (" + socket.getRemoteDevice().getAddress() + ")");
                             isAaConnected.set(true);
+                            updateStep(tvStepBt, "✓ BT RFCOMM: Phone connected (" + socket.getRemoteDevice().getName() + ")", Color.parseColor("#4ADE80"));
+                            setStatus("Phone Connected (BT)", "Starting Wireless Projection Protocol handshake...", "BT PAIRED", Color.parseColor("#38BDF8"));
+                            addLog("Phone connected to RFCOMM: " + socket.getRemoteDevice().getName());
                             handleAaRfcommSession(socket);
                         }
                     } catch (IOException e) {
@@ -551,26 +949,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void startWakeupPokeLoop() {
         new Thread(() -> {
             while (isRunning.get()) {
-                if (!isAaConnected.get() && !isHfpConnected.get()) {
-                    BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-                    if (adapter != null && adapter.isEnabled()) {
-                        for (BluetoothDevice dev : adapter.getBondedDevices()) {
-                            if (S25_MAC.equalsIgnoreCase(dev.getAddress()) || (dev.getName() != null && dev.getName().contains("S25 Ultra"))) {
-                                try {
-                                    Log.i(TAG, "[POKE] Poking " + dev.getName() + " on HFP-AG (" + HFP_AG_UUID + ")...");
-                                    BluetoothSocket pokeSocket = dev.createRfcommSocketToServiceRecord(HFP_AG_UUID);
-                                    pokeSocket.connect();
-                                    Log.i(TAG, "[POKE SUCCESS] Connected to S25 Ultra Audio Gateway! Holding 2.5s...");
-                                    Thread.sleep(2500);
-                                    pokeSocket.close();
-                                    Log.i(TAG, "[POKE] Released poke socket, waiting for phone incoming connection...");
-                                } catch (Exception e) {
-                                    Log.d(TAG, "[POKE INFO] Connect attempt: " + e.getMessage());
-                                }
-                                break;
-                            }
-                        }
-                    }
+                if (!isAaConnected.get() && !isHfpConnected.get() && !NativeCore.isProjecting()) {
+                    pokeOnce();
                 }
                 try {
                     Thread.sleep(15000);
@@ -593,6 +973,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 out.write(verReq);
                 out.flush();
                 Log.i(TAG, "[WPP TX] Sent WifiVersionRequest (Type 4, len=" + verReq.length + ") to phone");
+                updateStep(tvStepWpp, "● WPP: Sent WifiVersionRequest", Color.parseColor("#FBBF24"));
+                addLog("Sent WPP WifiVersionRequest");
 
                 // Step 2: Loop reading messages from phone
                 byte[] header = new byte[4];
@@ -623,6 +1005,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         out.write(startReq);
                         out.flush();
                         Log.i(TAG, "[WPP TX] Sent WifiStartRequest (Type 1) -> " + targetIp + ":" + AAP_PORT);
+                        updateStep(tvStepWpp, "● WPP: Verified Version -> Sent StartRequest", Color.parseColor("#FBBF24"));
+                        addLog("WPP: Version verified, sent StartRequest");
 
                     } else if (type == 2) {
                         // Type 2: WifiInfoRequest -> Send WifiInfoResponse (Type 3) with Wi-Fi Direct credentials
@@ -634,13 +1018,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         out.write(netInfo);
                         out.flush();
                         Log.i(TAG, "[WPP TX] Sent WifiInfoResponse (Type 3) SSID: " + p2pSsid + " Pass: " + p2pPass + " BSSID: " + p2pBssid);
+                        setStatus("Exchanging Wi-Fi Credentials", "Sending credentials for " + p2pSsid + " to phone...", "HANDSHAKE", Color.parseColor("#38BDF8"));
+                        updateStep(tvStepWpp, "✓ WPP: Exchanged Wi-Fi credentials", Color.parseColor("#4ADE80"));
+                        addLog("WPP: Sent Wi-Fi credentials to phone");
 
                     } else if (type == 6) {
                         // Type 6: WifiConnectStatus
                         Log.i(TAG, "[WPP RX] WifiConnectStatus received! Phone joined Wi-Fi network.");
+                        setStatus("Phone Joining Wi-Fi Direct", "Phone connected to Wi-Fi Direct group", "CONNECTING", Color.parseColor("#38BDF8"));
+                        updateStep(tvStepWpp, "✓ WPP: Phone joined Wi-Fi Direct network", Color.parseColor("#4ADE80"));
+                        addLog("WPP: Phone joined Wi-Fi network");
                     } else if (type == 7) {
                         // Type 7: WifiStartResponse
                         Log.i(TAG, "[WPP RX] WifiStartResponse received! Phone is joining Wi-Fi Direct...");
+                        addLog("WPP: WifiStartResponse received");
                     } else if (type == 8) {
                         // Type 8: Ping -> Echo back as Type 9 (Pong)
                         byte[] pong = wrapMessage(9, payload);
@@ -653,6 +1044,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Log.i(TAG, "WPP RFCOMM socket closed: " + e.getMessage());
             } finally {
                 isAaConnected.set(false);
+                addLog("RFCOMM session closed");
             }
         }, "AaRfcommSession").start();
     }

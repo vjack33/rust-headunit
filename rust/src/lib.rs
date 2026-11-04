@@ -2,7 +2,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::io::Cursor;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,6 +45,8 @@ extern "C" {
 
 static IS_RUNNING: AtomicBool = AtomicBool::new(false);
 static IS_PROJECTING: AtomicBool = AtomicBool::new(false);
+static SESSION_STATE: AtomicI32 = AtomicI32::new(0);
+pub static RENDERED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveSession {
     write_stream: TcpStream,
@@ -145,6 +147,30 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_sendTouch(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_openheadunit_rust_NativeCore_isProjecting(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> bool {
+    IS_PROJECTING.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_openheadunit_rust_NativeCore_getSessionState(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> c_int {
+    SESSION_STATE.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_openheadunit_rust_NativeCore_getRenderedFrames(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i64 {
+    RENDERED_FRAMES.load(Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
     env: *mut c_void,
     _class: *mut c_void,
@@ -208,10 +234,12 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
 
                         // Instantiate hardware video decoder bound to native window
                         let mut decoder = HardwareVideoDecoder::new(window);
-                        IS_PROJECTING.store(true, Ordering::SeqCst);
+                        SESSION_STATE.store(1, Ordering::SeqCst); // TCP Connected
+                        IS_PROJECTING.store(false, Ordering::SeqCst);
 
                         handle_aap_session(&mut stream, &mut decoder, &mut audio_sink);
 
+                        SESSION_STATE.store(5, Ordering::SeqCst); // Disconnected
                         IS_PROJECTING.store(false, Ordering::SeqCst);
                         log_info("[AAP Server] Phone session ended.");
                     }
@@ -339,6 +367,7 @@ fn handle_aap_session(
     };
 
     log_info("[AAP Session] Beginning TLS Handshake...");
+    SESSION_STATE.store(2, Ordering::SeqCst); // TLS Handshake
 
     // Send initial TLS ClientHello
     let mut client_hello = Vec::new();
@@ -430,6 +459,7 @@ fn handle_aap_session(
 
     // 5. Initialize Protocol State & Zero-Copy Assemblers
     log_info("[AAP Session] Entering Main AAP Service and Media Loop!");
+    SESSION_STATE.store(3, Ordering::SeqCst); // Protocol Setup
     // Set 15s read timeout to match open-headunit and prevent partial-read framing desync
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
     let mut video_assembler = VideoAssembler::new();
@@ -559,6 +589,8 @@ fn handle_aap_session(
                                         video_session_id = data[3] as i32;
                                     }
                                     log_info(&format!("[AAP Session] >>> VIDEO STREAM STARTED (session_id={}) <<<", video_session_id));
+                                    SESSION_STATE.store(4, Ordering::SeqCst); // Projecting Live
+                                    IS_PROJECTING.store(true, Ordering::SeqCst);
                                 }
                                 0x8002 => {
                                     // MEDIA_MESSAGE_STOP

@@ -140,6 +140,7 @@ impl HardwareVideoDecoder {
                         if out_idx >= 0 {
                             AMediaCodec_releaseOutputBuffer(codec_ptr, out_idx as usize, true);
                             let total = count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                            crate::RENDERED_FRAMES.fetch_add(1, Ordering::Relaxed);
                             if total % 300 == 0 {
                                 log(&format!("[Decoder] Rendered {} frames smoothly", total));
                             }
@@ -149,6 +150,7 @@ impl HardwareVideoDecoder {
                                 if next_idx >= 0 {
                                     AMediaCodec_releaseOutputBuffer(codec_ptr, next_idx as usize, true);
                                     count_clone.fetch_add(1, Ordering::Relaxed);
+                                    crate::RENDERED_FRAMES.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     break;
                                 }

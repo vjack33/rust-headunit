@@ -11,4 +11,8 @@ public class NativeCore {
     public static native void startEngine(Surface surface, int port);
     public static native void sendTouch(int action, int x, int y);
     public static native void stopEngine();
+
+    public static native boolean isProjecting();
+    public static native int getSessionState();
+    public static native long getRenderedFrames();
 }
