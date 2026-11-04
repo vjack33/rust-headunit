@@ -71,7 +71,7 @@ unsafe impl Send for HardwareVideoDecoder {}
 unsafe impl Sync for HardwareVideoDecoder {}
 
 impl HardwareVideoDecoder {
-    pub fn new(native_window: *mut c_void) -> Option<Self> {
+    pub fn new(native_window: *mut c_void, width: i32, height: i32) -> Option<Self> {
         if native_window.is_null() {
             log("[FAIL] native_window is null");
             return None;
@@ -91,8 +91,8 @@ impl HardwareVideoDecoder {
             let key_height = CString::new("height").unwrap();
             let key_max_input = CString::new("max-input-size").unwrap();
             AMediaFormat_setString(format, key_mime.as_ptr(), mime.as_ptr());
-            AMediaFormat_setInt32(format, key_width.as_ptr(), 1280);
-            AMediaFormat_setInt32(format, key_height.as_ptr(), 720);
+            AMediaFormat_setInt32(format, key_width.as_ptr(), width);
+            AMediaFormat_setInt32(format, key_height.as_ptr(), height);
             AMediaFormat_setInt32(format, key_max_input.as_ptr(), 2 * 1024 * 1024); // 2MB buffer
 
             let res = AMediaCodec_configure(c, format, native_window, std::ptr::null_mut(), 0);

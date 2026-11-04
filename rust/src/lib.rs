@@ -2,7 +2,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::io::Cursor;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,6 +47,14 @@ static IS_RUNNING: AtomicBool = AtomicBool::new(false);
 static IS_PROJECTING: AtomicBool = AtomicBool::new(false);
 static SESSION_STATE: AtomicI32 = AtomicI32::new(0);
 pub static RENDERED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+// Dynamic Headunit Settings
+pub static CONFIG_WIDTH: AtomicU32 = AtomicU32::new(1280);
+pub static CONFIG_HEIGHT: AtomicU32 = AtomicU32::new(720);
+pub static CONFIG_CODEC_RES: AtomicU32 = AtomicU32::new(2); // 1 = 800x480, 2 = 1280x720, 3 = 1920x1080
+pub static CONFIG_DENSITY: AtomicU32 = AtomicU32::new(160);
+pub static CONFIG_VEHICLE_TYPE: AtomicU32 = AtomicU32::new(3); // 1 = Car, 3 = Motorcycle
+pub static CONFIG_FPS: AtomicU32 = AtomicU32::new(60);
 
 struct ActiveSession {
     write_stream: TcpStream,
@@ -171,6 +179,29 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_getRenderedFrames(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_openheadunit_rust_NativeCore_setSettings(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    width: c_int,
+    height: c_int,
+    codec_res: c_int,
+    density: c_int,
+    vehicle_type: c_int,
+    fps: c_int,
+) {
+    CONFIG_WIDTH.store(width as u32, Ordering::SeqCst);
+    CONFIG_HEIGHT.store(height as u32, Ordering::SeqCst);
+    CONFIG_CODEC_RES.store(codec_res as u32, Ordering::SeqCst);
+    CONFIG_DENSITY.store(density as u32, Ordering::SeqCst);
+    CONFIG_VEHICLE_TYPE.store(vehicle_type as u32, Ordering::SeqCst);
+    CONFIG_FPS.store(fps as u32, Ordering::SeqCst);
+    log_info(&format!(
+        "[Settings] Config applied: {}x{} (codec_res={}), density={}dpi, vehicle_type={}, fps={}",
+        width, height, codec_res, density, vehicle_type, fps
+    ));
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
     env: *mut c_void,
     _class: *mut c_void,
@@ -234,8 +265,10 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
                         setsockopt(fd, 6 /* IPPROTO_TCP */, 12 /* TCP_QUICKACK */, &quickack as *const _ as *const c_void, std::mem::size_of_val(&quickack) as u32);
                         setpriority(0, 0, -16);
 
-                        // Instantiate hardware video decoder bound to native window
-                        let mut decoder = HardwareVideoDecoder::new(window);
+                        // Instantiate hardware video decoder bound to native window with dynamic resolution
+                        let w = CONFIG_WIDTH.load(Ordering::SeqCst) as i32;
+                        let h = CONFIG_HEIGHT.load(Ordering::SeqCst) as i32;
+                        let mut decoder = HardwareVideoDecoder::new(window, w, h);
                         SESSION_STATE.store(1, Ordering::SeqCst); // TCP Connected
                         IS_PROJECTING.store(false, Ordering::SeqCst);
 

@@ -15,4 +15,5 @@ public class NativeCore {
     public static native boolean isProjecting();
     public static native int getSessionState();
     public static native long getRenderedFrames();
+    public static native void setSettings(int width, int height, int codecRes, int density, int vehicleType, int fps);
 }

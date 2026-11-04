@@ -311,40 +311,49 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_uint32(1, ID_SEN as u32, &mut chan_sen);
     encode_submsg(2, &sensors_sub, &mut chan_sen); // sensor_source_service = 2
 
-    // 2. Channel 2: Video (1280x720, 60 FPS & 30 FPS, 160 DPI, H.264 Baseline Profile)
-    let mut vc60 = Vec::new();
-    encode_uint32(1, 2, &mut vc60); // codec_resolution = _1280x720 (2)
-    encode_uint32(2, 1, &mut vc60); // frame_rate = _60 (1) - 60 FPS buttery smooth
-    encode_uint32(3, 0, &mut vc60); // margin width = 0
-    encode_uint32(4, 0, &mut vc60); // margin height = 0
-    encode_uint32(5, 160, &mut vc60); // density = 160
-    encode_uint32(8, 10000, &mut vc60); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
-    encode_uint32(10, 3, &mut vc60); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
+    // 2. Channel 2: Video (Dynamic Resolution, FPS & DPI)
+    let codec_res = crate::CONFIG_CODEC_RES.load(std::sync::atomic::Ordering::SeqCst);
+    let density = crate::CONFIG_DENSITY.load(std::sync::atomic::Ordering::SeqCst);
+    let width = crate::CONFIG_WIDTH.load(std::sync::atomic::Ordering::SeqCst);
+    let height = crate::CONFIG_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    let vehicle_type = crate::CONFIG_VEHICLE_TYPE.load(std::sync::atomic::Ordering::SeqCst);
+    let target_fps = crate::CONFIG_FPS.load(std::sync::atomic::Ordering::SeqCst);
 
-    let mut vc30 = Vec::new();
-    encode_uint32(1, 2, &mut vc30); // codec_resolution = _1280x720 (2)
-    encode_uint32(2, 2, &mut vc30); // frame_rate = _30 (2)
-    encode_uint32(3, 0, &mut vc30); // margin width = 0
-    encode_uint32(4, 0, &mut vc30); // margin height = 0
-    encode_uint32(5, 160, &mut vc30); // density = 160
-    encode_uint32(8, 10000, &mut vc30); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
-    encode_uint32(10, 3, &mut vc30); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
+    let mut vc_primary = Vec::new();
+    encode_uint32(1, codec_res, &mut vc_primary); // codec_resolution (1=_800x480, 2=_1280x720, 3=_1920x1080)
+    encode_uint32(2, if target_fps == 30 { 2 } else { 1 }, &mut vc_primary); // frame_rate: 1=60fps, 2=30fps
+    encode_uint32(3, 0, &mut vc_primary); // margin width = 0
+    encode_uint32(4, 0, &mut vc_primary); // margin height = 0
+    encode_uint32(5, density, &mut vc_primary); // density
+    encode_uint32(8, 10000, &mut vc_primary); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
+    encode_uint32(10, 3, &mut vc_primary); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
 
     let mut av_vid = Vec::new();
     encode_uint32(1, 3, &mut av_vid); // available_type = H264_BP (3)
     encode_uint32(2, 0, &mut av_vid); // audio_type = NONE (0)
-    encode_submsg(4, &vc60, &mut av_vid); // video_configs[0] = 60fps (primary)
-    encode_submsg(4, &vc30, &mut av_vid); // video_configs[1] = 30fps (fallback)
+    encode_submsg(4, &vc_primary, &mut av_vid); // video_configs[0]
+
+    if target_fps != 30 {
+        let mut vc30 = Vec::new();
+        encode_uint32(1, codec_res, &mut vc30);
+        encode_uint32(2, 2, &mut vc30); // 30 FPS fallback
+        encode_uint32(3, 0, &mut vc30);
+        encode_uint32(4, 0, &mut vc30);
+        encode_uint32(5, density, &mut vc30);
+        encode_uint32(8, 10000, &mut vc30);
+        encode_uint32(10, 3, &mut vc30);
+        encode_submsg(4, &vc30, &mut av_vid);
+    }
     encode_bool(5, true, &mut av_vid); // available_while_in_call = true
 
     let mut chan_vid = Vec::new();
     encode_uint32(1, ID_VID as u32, &mut chan_vid);
     encode_submsg(3, &av_vid, &mut chan_vid); // media_sink_service = 3
 
-    // 3. Channel 3: Input (Touchscreen 1280x720)
+    // 3. Channel 3: Input (Touchscreen width x height)
     let mut tc = Vec::new();
-    encode_uint32(1, 1280, &mut tc);
-    encode_uint32(2, 720, &mut tc);
+    encode_uint32(1, width, &mut tc);
+    encode_uint32(2, height, &mut tc);
 
     let mut inp = Vec::new();
     encode_submsg(2, &tc, &mut inp); // touchscreen = 2
@@ -420,17 +429,22 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_bool(12, false, &mut out); // hide_projected_clock
     encode_string(14, "Oppo A37 AA", &mut out);
 
-    // HeadUnitInfo (Field 17) - with vehicle_type = 3 (Motorcycle: bypasses headunit mic check!)
+    // HeadUnitInfo (Field 17) - Dynamic vehicle type (3 = Bike/Motorcycle, 1 = Car)
+    let (make, model) = if vehicle_type == 3 {
+        ("Kawasaki", "Ninja") // Motorcycle
+    } else {
+        ("Honda", "Civic") // Car
+    };
     let mut hui = Vec::new();
-    encode_string(1, "Kawasaki", &mut hui);
-    encode_string(2, "Ninja", &mut hui);
+    encode_string(1, make, &mut hui);
+    encode_string(2, model, &mut hui);
     encode_string(3, "2025", &mut hui);
     encode_string(4, "OpenHeadUnit-Rust-01", &mut hui);
     encode_string(5, "OpenHeadunit", &mut hui);
     encode_string(6, "Rust-MSM8916", &mut hui);
     encode_string(7, "1", &mut hui);
     encode_string(8, "1.0.0", &mut hui);
-    encode_uint32(9, 3, &mut hui); // vehicle_type = 3 (Motorcycle)
+    encode_uint32(9, vehicle_type, &mut hui);
     encode_submsg(17, &hui, &mut out);
 
     out

@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.net.NetworkInfo;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
@@ -36,6 +37,8 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
+import android.widget.Toast;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
@@ -91,6 +94,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private volatile boolean isOverlayHidden = false;
 
+    // User Settings & Preferences
+    private static final String PREFS_NAME = "HeadunitPrefs";
+    private static final String PREF_RES_WIDTH = "res_width";
+    private static final String PREF_RES_HEIGHT = "res_height";
+    private static final String PREF_CODEC_RES = "codec_res";
+    private static final String PREF_DENSITY = "density";
+    private static final String PREF_VEHICLE_TYPE = "vehicle_type";
+    private static final String PREF_FPS = "fps";
+
+    private volatile int curWidth = 1280;
+    private volatile int curHeight = 720;
+    private volatile int curCodecRes = 2; // 1 = 800x480, 2 = 1280x720, 3 = 1920x1080
+    private volatile int curDensity = 160;
+    private volatile int curVehicleType = 3; // 3 = Motorcycle / Bike, 1 = Car
+    private volatile int curFps = 60;
+
+    private View settingsOverlayView;
+    private Button btnSettings;
+    private Button floatingSettingsBtn;
+
     private BluetoothServerSocket aaServerSocket;
     private BluetoothServerSocket hfpServerSocket;
     private BluetoothSocket activeHfpSocket;
@@ -115,11 +138,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         hideSystemUI();
 
+        loadSettings();
+
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().addCallback(this);
-        // Pin the Surface buffer to the exact video resolution so SurfaceFlinger
-        // composites at 1:1 pixel ratio — prevents DPI-scaled cropping on hdpi displays.
-        surfaceView.getHolder().setFixedSize(1280, 720);
+        // Pin the Surface buffer to the configured video resolution
+        surfaceView.getHolder().setFixedSize(curWidth, curHeight);
 
         rootLayout = new FrameLayout(this);
         rootLayout.addView(surfaceView,
@@ -133,11 +157,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
+        // Floating quick-settings button during active AA video streaming
+        floatingSettingsBtn = new Button(this);
+        floatingSettingsBtn.setText("⚙");
+        floatingSettingsBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        floatingSettingsBtn.setTextColor(Color.WHITE);
+        floatingSettingsBtn.setBackground(makeRoundedDrawable(Color.parseColor("#B30F172A"), Color.parseColor("#334155"), dp(1), dp(18)));
+        FrameLayout.LayoutParams floatLp = new FrameLayout.LayoutParams(dp(36), dp(36));
+        floatLp.gravity = Gravity.TOP | Gravity.START;
+        floatLp.setMargins(dp(12), dp(12), 0, 0);
+        floatingSettingsBtn.setLayoutParams(floatLp);
+        floatingSettingsBtn.setVisibility(View.GONE);
+        floatingSettingsBtn.setOnClickListener(v -> showSettings());
+        rootLayout.addView(floatingSettingsBtn);
+
+        settingsOverlayView = buildSettingsOverlayView();
+        settingsOverlayView.setVisibility(View.GONE);
+        rootLayout.addView(settingsOverlayView,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
         setContentView(rootLayout);
 
-        // Touch forwarding to Rust Native Input Channel (scaled 1:1 to 1280x720)
+        // Touch forwarding to Rust Native Input Channel (scaled 1:1 to configured resolution)
         surfaceView.setOnTouchListener((v, event) -> {
             int actionMasked = event.getActionMasked();
+            int pointerCount = event.getPointerCount();
+
+            // 3-finger tap: summon Headunit Settings during active AA projection
+            if (pointerCount >= 3) {
+                if (actionMasked == MotionEvent.ACTION_POINTER_DOWN || actionMasked == MotionEvent.ACTION_DOWN) {
+                    showSettings();
+                    return true;
+                }
+            }
+
             int aapAction = 2; // DRAG
             if (actionMasked == MotionEvent.ACTION_DOWN) {
                 aapAction = 0; // PRESS
@@ -148,16 +203,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             int viewH = v.getHeight();
             int touchX = (int) event.getX();
             int touchY = (int) event.getY();
-            if (viewW > 0 && viewH > 0 && (viewW != 1280 || viewH != 720)) {
-                touchX = (int) (event.getX() * 1280f / viewW);
-                touchY = (int) (event.getY() * 720f / viewH);
+            if (viewW > 0 && viewH > 0 && (viewW != curWidth || viewH != curHeight)) {
+                touchX = (int) (event.getX() * (float) curWidth / viewW);
+                touchY = (int) (event.getY() * (float) curHeight / viewH);
             }
             NativeCore.sendTouch(aapAction, touchX, touchY);
             return true;
         });
 
-        // Initialize Native Rust Core
+        // Initialize Native Rust Core & apply settings
         NativeCore.init();
+        NativeCore.setSettings(curWidth, curHeight, curCodecRes, curDensity, curVehicleType, curFps);
         isRunning.set(true);
 
         // Boost CPU & GPU hardware clocks for smooth 60 FPS presentation
@@ -220,6 +276,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         Log.i(TAG, "Surface created, starting Rust native engine on port " + AAP_PORT);
+        NativeCore.setSettings(curWidth, curHeight, curCodecRes, curDensity, curVehicleType, curFps);
         NativeCore.startEngine(holder.getSurface(), AAP_PORT);
     }
 
@@ -308,6 +365,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         tvBadge.setTextColor(Color.parseColor("#38BDF8"));
         tvBadge.setPadding(dp(10), dp(4), dp(10), dp(4));
         tvBadge.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#38BDF8"), dp(1), dp(12)));
+        btnSettings = new Button(this);
+        btnSettings.setText("⚙ Settings");
+        btnSettings.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        btnSettings.setTypeface(Typeface.DEFAULT_BOLD);
+        btnSettings.setTextColor(Color.parseColor("#94A3B8"));
+        btnSettings.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#334155"), dp(1), dp(12)));
+        btnSettings.setPadding(dp(10), dp(4), dp(10), dp(4));
+        LinearLayout.LayoutParams setLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        setLp.setMargins(0, 0, dp(8), 0);
+        btnSettings.setLayoutParams(setLp);
+        btnSettings.setOnClickListener(v -> showSettings());
+
+        headerRow.addView(btnSettings);
         headerRow.addView(tvBadge);
 
         centerCard.addView(headerRow);
@@ -484,9 +557,328 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void updateBottomInfo() {
         uiHandler.post(() -> {
             if (tvBottomInfo != null) {
-                tvBottomInfo.setText("SSID: " + p2pSsid + " | Pass: " + p2pPass + " | Port: " + AAP_PORT + " | Venus HW Decoder");
+                String modeName = curVehicleType == 3 ? "🏍 Bike (Ninja)" : "🚗 Car (Civic)";
+                tvBottomInfo.setText(modeName + " | " + curWidth + "x" + curHeight + "@" + curFps + "fps (" + curDensity + " DPI) | " + p2pSsid);
             }
         });
+    }
+
+    private void loadSettings() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        curWidth = prefs.getInt(PREF_RES_WIDTH, 1280);
+        curHeight = prefs.getInt(PREF_RES_HEIGHT, 720);
+        curCodecRes = prefs.getInt(PREF_CODEC_RES, 2);
+        curDensity = prefs.getInt(PREF_DENSITY, 160);
+        curVehicleType = prefs.getInt(PREF_VEHICLE_TYPE, 3); // 3 = Bike / Motorcycle
+        curFps = prefs.getInt(PREF_FPS, 60);
+    }
+
+    private void saveSettings(int width, int height, int codecRes, int density, int vehicleType, int fps) {
+        curWidth = width;
+        curHeight = height;
+        curCodecRes = codecRes;
+        curDensity = density;
+        curVehicleType = vehicleType;
+        curFps = fps;
+
+        SharedPreferences.Editor editor = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+        editor.putInt(PREF_RES_WIDTH, width);
+        editor.putInt(PREF_RES_HEIGHT, height);
+        editor.putInt(PREF_CODEC_RES, codecRes);
+        editor.putInt(PREF_DENSITY, density);
+        editor.putInt(PREF_VEHICLE_TYPE, vehicleType);
+        editor.putInt(PREF_FPS, fps);
+        editor.apply();
+
+        NativeCore.setSettings(curWidth, curHeight, curCodecRes, curDensity, curVehicleType, curFps);
+        if (surfaceView != null) {
+            surfaceView.getHolder().setFixedSize(curWidth, curHeight);
+        }
+        updateBottomInfo();
+        String modeName = curVehicleType == 3 ? "🏍 Bike" : "🚗 Car";
+        addLog("Saved: " + modeName + " • " + curWidth + "x" + curHeight + "@" + curFps + "fps (" + curDensity + " DPI)");
+    }
+
+    // Selected options in settings dialog
+    private int optVehicleType;
+    private int optCodecRes;
+    private int optWidth;
+    private int optHeight;
+    private int optDensity;
+    private int optFps;
+
+    private Button btnModeBike;
+    private Button btnModeCar;
+    private Button btnRes720;
+    private Button btnRes480;
+    private Button btnRes1080;
+    private Button btnDpi140;
+    private Button btnDpi160;
+    private Button btnDpi180;
+    private Button btnDpi210;
+    private Button btnDpi240;
+    private Button btnFps60;
+    private Button btnFps30;
+
+    private View buildSettingsOverlayView() {
+        FrameLayout container = new FrameLayout(this);
+        container.setBackgroundColor(Color.parseColor("#D9090D16")); // Translucent dark backdrop
+
+        // Close on tap outside
+        container.setOnClickListener(v -> hideSettings());
+
+        // Center card with scroll view
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setVerticalScrollBarEnabled(false);
+        FrameLayout.LayoutParams scrollLp = new FrameLayout.LayoutParams(
+            dp(560),
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        );
+        scrollLp.gravity = Gravity.CENTER;
+        scrollLp.setMargins(0, dp(8), 0, dp(8));
+        scrollView.setLayoutParams(scrollLp);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(makeRoundedDrawable(Color.parseColor("#131B2E"), Color.parseColor("#253550"), dp(1), dp(14)));
+        card.setPadding(dp(20), dp(12), dp(20), dp(12));
+        card.setOnClickListener(v -> {}); // Prevent tap-through dismissal
+
+        // Header
+        TextView tvTitle = new TextView(this);
+        tvTitle.setText("⚙ HEADUNIT SETTINGS");
+        tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tvTitle.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        tvTitle.setTextColor(Color.parseColor("#38BDF8"));
+        card.addView(tvTitle);
+
+        TextView tvSub = new TextView(this);
+        tvSub.setText("Configure Android Auto vehicle profile, resolution and density scaling");
+        tvSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        tvSub.setTextColor(Color.parseColor("#64748B"));
+        card.addView(tvSub);
+
+        // Divider
+        View div1 = new View(this);
+        div1.setBackgroundColor(Color.parseColor("#1E293B"));
+        LinearLayout.LayoutParams divLp1 = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+        divLp1.setMargins(0, dp(6), 0, dp(6));
+        card.addView(div1, divLp1);
+
+        // 1. VEHICLE MODE
+        addSectionTitle(card, "VEHICLE MODE");
+        LinearLayout rowMode = new LinearLayout(this);
+        rowMode.setOrientation(LinearLayout.HORIZONTAL);
+
+        btnModeBike = createChoiceButton("🏍 Bike / Motorcycle", false, v -> {
+            optVehicleType = 3;
+            updateSettingsUI();
+        });
+        btnModeCar = createChoiceButton("🚗 Car", false, v -> {
+            optVehicleType = 1;
+            updateSettingsUI();
+        });
+        rowMode.addView(btnModeBike);
+        rowMode.addView(btnModeCar);
+        card.addView(rowMode);
+
+        TextView tvBikeNote = new TextView(this);
+        tvBikeNote.setText("• Bike mode uses phone mic (bypasses car mic check) & reports Kawasaki Ninja");
+        tvBikeNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvBikeNote.setTextColor(Color.parseColor("#64748B"));
+        LinearLayout.LayoutParams noteLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        noteLp.setMargins(dp(4), dp(2), 0, dp(6));
+        card.addView(tvBikeNote, noteLp);
+
+        // 2. RESOLUTION
+        addSectionTitle(card, "SCREEN RESOLUTION");
+        LinearLayout rowRes = new LinearLayout(this);
+        rowRes.setOrientation(LinearLayout.HORIZONTAL);
+
+        btnRes720 = createChoiceButton("720p (1280x720) ★", false, v -> {
+            optWidth = 1280; optHeight = 720; optCodecRes = 2;
+            updateSettingsUI();
+        });
+        btnRes480 = createChoiceButton("480p (800x480)", false, v -> {
+            optWidth = 800; optHeight = 480; optCodecRes = 1;
+            updateSettingsUI();
+        });
+        btnRes1080 = createChoiceButton("1080p (1920x1080)", false, v -> {
+            optWidth = 1920; optHeight = 1080; optCodecRes = 3;
+            updateSettingsUI();
+        });
+        rowRes.addView(btnRes720);
+        rowRes.addView(btnRes480);
+        rowRes.addView(btnRes1080);
+        card.addView(rowRes);
+
+        // 3. DISPLAY DENSITY (DPI)
+        addSectionTitle(card, "DISPLAY DENSITY (UI SCALING)");
+        LinearLayout rowDpi = new LinearLayout(this);
+        rowDpi.setOrientation(LinearLayout.HORIZONTAL);
+
+        btnDpi140 = createChoiceButton("140", false, v -> { optDensity = 140; updateSettingsUI(); });
+        btnDpi160 = createChoiceButton("160 Default", false, v -> { optDensity = 160; updateSettingsUI(); });
+        btnDpi180 = createChoiceButton("180 Medium", false, v -> { optDensity = 180; updateSettingsUI(); });
+        btnDpi210 = createChoiceButton("210 Large", false, v -> { optDensity = 210; updateSettingsUI(); });
+        btnDpi240 = createChoiceButton("240 XL", false, v -> { optDensity = 240; updateSettingsUI(); });
+        rowDpi.addView(btnDpi140);
+        rowDpi.addView(btnDpi160);
+        rowDpi.addView(btnDpi180);
+        rowDpi.addView(btnDpi210);
+        rowDpi.addView(btnDpi240);
+        card.addView(rowDpi);
+
+        TextView tvDpiNote = new TextView(this);
+        tvDpiNote.setText("• Higher DPI (210/240) renders larger buttons and text, ideal for glove touch on bikes");
+        tvDpiNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvDpiNote.setTextColor(Color.parseColor("#64748B"));
+        LinearLayout.LayoutParams dpiNoteLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        dpiNoteLp.setMargins(dp(4), dp(2), 0, dp(6));
+        card.addView(tvDpiNote, dpiNoteLp);
+
+        // 4. FRAME RATE
+        addSectionTitle(card, "TARGET FRAME RATE");
+        LinearLayout rowFps = new LinearLayout(this);
+        rowFps.setOrientation(LinearLayout.HORIZONTAL);
+
+        btnFps60 = createChoiceButton("60 FPS (Ultra Smooth)", false, v -> { optFps = 60; updateSettingsUI(); });
+        btnFps30 = createChoiceButton("30 FPS (Power Saver)", false, v -> { optFps = 30; updateSettingsUI(); });
+        rowFps.addView(btnFps60);
+        rowFps.addView(btnFps30);
+        card.addView(rowFps);
+
+        // Action Buttons Row
+        LinearLayout actionRow = new LinearLayout(this);
+        actionRow.setOrientation(LinearLayout.HORIZONTAL);
+        actionRow.setGravity(Gravity.END);
+        LinearLayout.LayoutParams actLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        actLp.setMargins(0, dp(10), 0, 0);
+        actionRow.setLayoutParams(actLp);
+
+        Button btnCancel = new Button(this);
+        btnCancel.setText("Cancel");
+        btnCancel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        btnCancel.setTextColor(Color.parseColor("#94A3B8"));
+        btnCancel.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#334155"), dp(1), dp(8)));
+        btnCancel.setPadding(dp(16), dp(6), dp(16), dp(6));
+        btnCancel.setOnClickListener(v -> hideSettings());
+        actionRow.addView(btnCancel);
+
+        Button btnSave = new Button(this);
+        btnSave.setText("Save & Apply");
+        btnSave.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        btnSave.setTypeface(Typeface.DEFAULT_BOLD);
+        btnSave.setTextColor(Color.WHITE);
+        btnSave.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), 0, 0, dp(8)));
+        btnSave.setPadding(dp(20), dp(6), dp(20), dp(6));
+        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        saveLp.setMargins(dp(10), 0, 0, 0);
+        btnSave.setLayoutParams(saveLp);
+        btnSave.setOnClickListener(v -> {
+            saveSettings(optWidth, optHeight, optCodecRes, optDensity, optVehicleType, optFps);
+            hideSettings();
+            Toast.makeText(MainActivity.this, "Settings applied!", Toast.LENGTH_SHORT).show();
+        });
+        actionRow.addView(btnSave);
+
+        card.addView(actionRow);
+
+        scrollView.addView(card);
+        container.addView(scrollView);
+        return container;
+    }
+
+    private void addSectionTitle(LinearLayout parent, String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setTextColor(Color.parseColor("#94A3B8"));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(4), 0, dp(2));
+        tv.setLayoutParams(lp);
+        parent.addView(tv);
+    }
+
+    private Button createChoiceButton(String text, boolean selected, View.OnClickListener onClick) {
+        Button btn = new Button(this);
+        btn.setText(text);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        btn.setTypeface(Typeface.DEFAULT_BOLD);
+        styleChoiceButton(btn, selected);
+        btn.setPadding(dp(6), dp(4), dp(6), dp(4));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            0,
+            dp(32),
+            1.0f
+        );
+        lp.setMargins(dp(3), 0, dp(3), 0);
+        btn.setLayoutParams(lp);
+        btn.setOnClickListener(onClick);
+        return btn;
+    }
+
+    private void styleChoiceButton(Button btn, boolean selected) {
+        if (btn == null) return;
+        if (selected) {
+            btn.setBackground(makeRoundedDrawable(Color.parseColor("#2563EB"), Color.parseColor("#60A5FA"), dp(1), dp(8)));
+            btn.setTextColor(Color.WHITE);
+        } else {
+            btn.setBackground(makeRoundedDrawable(Color.parseColor("#1E293B"), Color.parseColor("#334155"), dp(1), dp(8)));
+            btn.setTextColor(Color.parseColor("#94A3B8"));
+        }
+    }
+
+    private void updateSettingsUI() {
+        styleChoiceButton(btnModeBike, optVehicleType == 3);
+        styleChoiceButton(btnModeCar, optVehicleType == 1);
+
+        styleChoiceButton(btnRes720, optCodecRes == 2);
+        styleChoiceButton(btnRes480, optCodecRes == 1);
+        styleChoiceButton(btnRes1080, optCodecRes == 3);
+
+        styleChoiceButton(btnDpi140, optDensity == 140);
+        styleChoiceButton(btnDpi160, optDensity == 160);
+        styleChoiceButton(btnDpi180, optDensity == 180);
+        styleChoiceButton(btnDpi210, optDensity == 210);
+        styleChoiceButton(btnDpi240, optDensity == 240);
+
+        styleChoiceButton(btnFps60, optFps == 60);
+        styleChoiceButton(btnFps30, optFps == 30);
+    }
+
+    private void showSettings() {
+        optVehicleType = curVehicleType;
+        optCodecRes = curCodecRes;
+        optWidth = curWidth;
+        optHeight = curHeight;
+        optDensity = curDensity;
+        optFps = curFps;
+
+        updateSettingsUI();
+
+        if (settingsOverlayView != null) {
+            settingsOverlayView.setVisibility(View.VISIBLE);
+            settingsOverlayView.setAlpha(0f);
+            settingsOverlayView.animate().alpha(1f).setDuration(250);
+        }
+        if (floatingSettingsBtn != null) {
+            floatingSettingsBtn.setVisibility(View.GONE);
+        }
+    }
+
+    private void hideSettings() {
+        if (settingsOverlayView != null) {
+            settingsOverlayView.animate().alpha(0f).setDuration(200).withEndAction(() -> {
+                settingsOverlayView.setVisibility(View.GONE);
+            });
+        }
+        if (floatingSettingsBtn != null && isOverlayHidden) {
+            floatingSettingsBtn.setVisibility(View.VISIBLE);
+            floatingSettingsBtn.setAlpha(0f);
+            floatingSettingsBtn.animate().alpha(0.6f).setDuration(250);
+        }
     }
 
     private int lastReportedState = -1;
@@ -508,6 +900,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             .alpha(0f)
                             .setDuration(400)
                             .withEndAction(() -> overlayView.setVisibility(View.GONE));
+                        if (floatingSettingsBtn != null) {
+                            floatingSettingsBtn.setVisibility(View.VISIBLE);
+                            floatingSettingsBtn.setAlpha(0f);
+                            floatingSettingsBtn.animate().alpha(0.6f).setDuration(400);
+                        }
                     }
                 } else {
                     if (isOverlayHidden) {
@@ -516,6 +913,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         overlayView.setVisibility(View.VISIBLE);
                         overlayView.setAlpha(0f);
                         overlayView.animate().alpha(1f).setDuration(300);
+                        if (floatingSettingsBtn != null) {
+                            floatingSettingsBtn.animate().alpha(0f).setDuration(200).withEndAction(() -> {
+                                floatingSettingsBtn.setVisibility(View.GONE);
+                            });
+                        }
                     }
 
                     if (state != lastReportedState) {
@@ -1141,13 +1543,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // WifiVersionRequest (Type 4)
-    private static byte[] buildWifiVersionRequest() throws IOException {
+    private byte[] buildWifiVersionRequest() throws IOException {
+        String make = curVehicleType == 3 ? "Kawasaki" : "Honda";
+        String model = curVehicleType == 3 ? "Ninja" : "Civic";
         // WppCarInfo
         ByteArrayOutputStream carBaos = new ByteArrayOutputStream();
-        writeFieldString(carBaos, 1, "Kawasaki");
-        writeFieldString(carBaos, 2, "A37");
-        writeFieldString(carBaos, 3, "2024");
-        writeFieldString(carBaos, 5, "Kawasaki");
+        writeFieldString(carBaos, 1, make);
+        writeFieldString(carBaos, 2, model);
+        writeFieldString(carBaos, 3, "2025");
+        writeFieldString(carBaos, 5, make);
         writeFieldString(carBaos, 6, "RustHeadunit");
         writeFieldString(carBaos, 7, "1.0");
         writeFieldString(carBaos, 8, "1.0");
