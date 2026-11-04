@@ -39,11 +39,19 @@ extern "C" {
     fn ANativeWindow_setBuffersGeometry(window: *mut c_void, width: i32, height: i32, format: i32) -> i32;
     fn ANativeWindow_lock(window: *mut c_void, outBuffer: *mut ANativeWindow_Buffer, inOutDirtyBounds: *mut c_void) -> i32;
     fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
+    fn setpriority(which: c_int, who: c_int, prio: c_int) -> c_int;
+    fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
 }
 
 static IS_RUNNING: AtomicBool = AtomicBool::new(false);
 static IS_PROJECTING: AtomicBool = AtomicBool::new(false);
-static PENDING_TOUCH: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+
+struct ActiveSession {
+    write_stream: TcpStream,
+    tls: Arc<Mutex<Option<ClientConnection>>>,
+}
+
+static ACTIVE_SESSION: Mutex<Option<ActiveSession>> = Mutex::new(None);
 
 fn log_info(msg: &str) {
     let tag = CString::new("RustHeadunit").unwrap();
@@ -127,9 +135,11 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_sendTouch(
     x: c_int,
     y: c_int,
 ) {
-    if let Ok(mut touches) = PENDING_TOUCH.lock() {
-        if touches.len() < 50 {
-            touches.push((action as u32, x as u32, y as u32));
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        if let Some(session) = guard.as_mut() {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+            let touch_payload = build_touch_event_indication(action as u32, x as u32, y as u32, ts);
+            let _ = write_frame(&mut session.write_stream, &session.tls, ID_INP, FLAG_SINGLE, &touch_payload, true);
         }
     }
 }
@@ -189,6 +199,13 @@ pub extern "system" fn Java_com_openheadunit_rust_NativeCore_startEngine(
                         stream.set_nodelay(true).ok();
                         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
+                        // Optimize TCP receive buffer to 1MB and boost thread priority to realtime (-10)
+                        use std::os::unix::io::AsRawFd;
+                        let fd = stream.as_raw_fd();
+                        let rcv_buf: c_int = 1024 * 1024;
+                        setsockopt(fd, 1, 8, &rcv_buf as *const _ as *const c_void, std::mem::size_of_val(&rcv_buf) as u32);
+                        setpriority(0, 0, -10);
+
                         // Instantiate hardware video decoder bound to native window
                         let mut decoder = HardwareVideoDecoder::new(window);
                         IS_PROJECTING.store(true, Ordering::SeqCst);
@@ -221,6 +238,15 @@ fn handle_aap_session(
 ) {
     log_info("[AAP Session] Starting Session Handler...");
 
+    let mut write_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log_err(&format!("[AAP Session] try_clone failed: {}", e));
+            return;
+        }
+    };
+    let session_tls: Arc<Mutex<Option<ClientConnection>>> = Arc::new(Mutex::new(None));
+
     // Check if phone sent any initial bytes (peek non-blocking)
     stream.set_nonblocking(true).ok();
     let mut peek_buf = [0u8; 64];
@@ -234,7 +260,7 @@ fn handle_aap_session(
         _ => {}
     }
     stream.set_nonblocking(false).ok();
-    stream.set_read_timeout(Some(Duration::from_millis(2000))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
     // 1. Send VERSION_REQUEST with retries matching open-headunit
     let ver_req = [0x00, 0x01, 0x00, 0x01, 0x00, 0x02];
@@ -242,14 +268,14 @@ fn handle_aap_session(
 
     for attempt in 1..=4 {
         log_info(&format!("[AAP Session] Sending Version Request (1.2) [attempt {}/4]...", attempt));
-        if let Err(e) = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &ver_req, false) {
+        if let Err(e) = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &ver_req, false) {
             log_err(&format!("[AAP Session] Failed to send VersionRequest: {}", e));
             return;
         }
 
         let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         while std::time::Instant::now() < deadline {
-            match read_frame(stream, &mut None) {
+            match read_frame(stream, &session_tls) {
                 Ok(f) => {
                     log_info(&format!(
                         "[AAP Session] Received frame: chan={}, flags=0x{:02X}, len={}",
@@ -323,7 +349,7 @@ fn handle_aap_session(
 
     let mut ssl_frame_data = vec![0x00, 0x03]; // MESSAGE_ENCAPSULATED_SSL
     ssl_frame_data.extend(client_hello);
-    if let Err(e) = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &ssl_frame_data, false) {
+    if let Err(e) = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &ssl_frame_data, false) {
         log_err(&format!("[AAP Session] Failed to send ClientHello: {}", e));
         return;
     }
@@ -331,7 +357,7 @@ fn handle_aap_session(
     // Loop through SSL Handshake
     let mut hs_completed = false;
     for step in 0..20 {
-        match read_frame(stream, &mut None) {
+        match read_frame(stream, &session_tls) {
             Ok(f) => {
                 log_info(&format!(
                     "[AAP Session] TLS step {}: received frame chan={}, flags=0x{:02X}, len={}",
@@ -355,7 +381,7 @@ fn handle_aap_session(
                     if !next_data.is_empty() {
                         let mut next_frame = vec![0x00, 0x03];
                         next_frame.extend(next_data);
-                        let _ = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &next_frame, false);
+                        let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &next_frame, false);
                     }
 
                     if !tls_client.is_handshaking() {
@@ -384,30 +410,34 @@ fn handle_aap_session(
     // 4. Send AUTH_COMPLETE (Plaintext AAP frame, unencrypted! As specified in open-headunit AapTlsWriter)
     log_info("[AAP Session] Sending AuthCompleteIndication (Plaintext STATUS_OK)...");
     let auth_complete = [0x00, 0x04, 0x08, 0x00]; // type=4, status=STATUS_SUCCESS (0)
-    if let Err(e) = write_frame(stream, &mut None, ID_CTR, FLAG_SINGLE, &auth_complete, false) {
+    if let Err(e) = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &auth_complete, false) {
         log_err(&format!("[AAP Session] Failed to send AuthComplete: {}", e));
         return;
     }
 
-    let mut active_tls = Some(tls_client);
+    // Activate TLS for subsequent encrypted frames
+    *session_tls.lock().unwrap() = Some(tls_client);
+
+    // Register active session for instantaneous touch event forwarding
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        if let Ok(ws) = stream.try_clone() {
+            *guard = Some(ActiveSession {
+                write_stream: ws,
+                tls: Arc::clone(&session_tls),
+            });
+        }
+    }
 
     // 5. Initialize Protocol State & Zero-Copy Assemblers
     log_info("[AAP Session] Entering Main AAP Service and Media Loop!");
+    // Set 15s read timeout to match open-headunit and prevent partial-read framing desync
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
     let mut video_assembler = VideoAssembler::new();
     let mut video_session_id: i32 = 0;
     let mut audio_session_id: i32 = 0;
 
     while IS_RUNNING.load(Ordering::Relaxed) {
-        // Send any pending touches on Channel ID_INP (3)
-        if let Ok(mut touches) = PENDING_TOUCH.lock() {
-            while let Some((action, x, y)) = touches.pop() {
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
-                let touch_payload = build_touch_event_indication(action, x, y, ts);
-                let _ = write_frame(stream, &mut active_tls, ID_INP, FLAG_SINGLE, &touch_payload, true);
-            }
-        }
-
-        match read_frame(stream, &mut active_tls) {
+        match read_frame(stream, &session_tls) {
             Ok(frame) => {
                 let channel = frame.channel;
                 let data = &frame.payload;
@@ -416,16 +446,18 @@ fn handle_aap_session(
                 } else {
                     0xFFFF
                 };
-                log_info(&format!(
-                    "[AAP RX] chan={}, flags=0x{:02X}, len={}, msg_type=0x{:04X}",
-                    channel, frame.flags, data.len(), msg_type
-                ));
+                if channel != ID_VID && msg_type != 0x000B {
+                    log_info(&format!(
+                        "[AAP RX] chan={}, flags=0x{:02X}, len={}, msg_type=0x{:04X}",
+                        channel, frame.flags, data.len(), msg_type
+                    ));
+                }
 
                 if msg_type == 0x000B {
                     // PING_REQUEST -> PING_RESPONSE (respond immediately on any channel)
                     let ping_payload = if data.len() >= 2 { &data[2..] } else { &[] };
                     let ping_resp = build_ping_response(ping_payload);
-                    let _ = write_frame(stream, &mut active_tls, channel, FLAG_SINGLE, &ping_resp, true);
+                    let _ = write_frame(&mut write_stream, &session_tls, channel, FLAG_SINGLE, &ping_resp, true);
                     continue;
                 }
 
@@ -445,29 +477,29 @@ fn handle_aap_session(
                                     // SERVICE_DISCOVERY_REQUEST -> SERVICE_DISCOVERY_RESPONSE
                                     log_info("[AAP Session] Got ServiceDiscoveryRequest -> Sending comprehensive ServiceDiscoveryResponse");
                                     let sd_resp = build_service_discovery_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &sd_resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &sd_resp, true);
                                 }
                                 0x0007 => {
                                     // CHANNEL_OPEN_REQUEST
                                     let resp = build_channel_open_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &resp, true);
                                 }
                                 0x000B => {
                                     // PING_REQUEST -> PING_RESPONSE
                                     let ping_resp = build_ping_response(&data[2..]);
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &ping_resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &ping_resp, true);
                                 }
                                 0x000F => {
                                     // BYEBYE_REQUEST -> BYEBYE_RESPONSE & quit
                                     log_info("[AAP Session] ByeByeRequest received from phone. Session terminating cleanly.");
                                     let byebye_resp = [0x00, 0x10]; // MESSAGE_BYEBYE_RESPONSE
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &byebye_resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &byebye_resp, true);
                                     break;
                                 }
                                 0x0012 => {
                                     // AUDIO_FOCUS_REQUEST -> AUDIO_FOCUS_NOTIFICATION (always grant)
                                     let af_resp = build_audio_focus_notification();
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &af_resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &af_resp, true);
                                 }
                                 _ => {}
                             }
@@ -482,17 +514,17 @@ fn handle_aap_session(
                                     // CHANNEL_OPEN_REQUEST
                                     log_info("[AAP Session] Sensor Channel Open Request -> OK (sending OpenResponse & DrivingStatus UNRESTRICTED)");
                                     let resp = build_channel_open_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_SEN, FLAG_SINGLE, &resp, true);
                                     let ds = build_sensor_driving_status();
-                                    let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &ds, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_SEN, FLAG_SINGLE, &ds, true);
                                 }
                                 0x8001 => {
                                     // SENSOR_STARTREQUEST -> SENSOR_STARTRESPONSE + SENSOR_EVENT (driving_status UNRESTRICTED)
                                     log_info("[AAP Session] Sensor Start Request -> Replying SUCCESS & DrivingStatus UNRESTRICTED");
                                     let resp = build_sensor_start_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_SEN, FLAG_SINGLE, &resp, true);
                                     let ds = build_sensor_driving_status();
-                                    let _ = write_frame(stream, &mut active_tls, ID_SEN, FLAG_SINGLE, &ds, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_SEN, FLAG_SINGLE, &ds, true);
                                 }
                                 _ => {}
                             }
@@ -511,15 +543,15 @@ fn handle_aap_session(
                                     // CHANNEL_OPEN_REQUEST
                                     log_info("[AAP Session] Video Channel Open Request -> OK");
                                     let resp = build_channel_open_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_VID, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_VID, FLAG_SINGLE, &resp, true);
                                 }
                                 0x8000 => {
                                     // MEDIA_MESSAGE_SETUP -> MEDIA_MESSAGE_CONFIG & MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION
                                     log_info("[AAP Session] Video Setup Request -> Replying Config READY & Gaining Video Focus");
-                                    let config_resp = build_media_config_response(10);
-                                    let _ = write_frame(stream, &mut active_tls, ID_VID, FLAG_SINGLE, &config_resp, true);
+                                    let config_resp = build_media_config_response(16);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_VID, FLAG_SINGLE, &config_resp, true);
                                     let focus_notif = build_video_focus_notification();
-                                    let _ = write_frame(stream, &mut active_tls, ID_VID, FLAG_SINGLE, &focus_notif, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_VID, FLAG_SINGLE, &focus_notif, true);
                                 }
                                 0x8001 => {
                                     // MEDIA_MESSAGE_START
@@ -540,16 +572,13 @@ fn handle_aap_session(
                             }
                         } else {
                             // H.264 Video Stream Fragment (CSD or Media Data Access Unit)
-                            log_info(&format!("[AAP Session] Video fragment rx: flags=0x{:02x}, len={}", frame.flags, frame.payload.len()));
                             if let Some(unit) = video_assembler.on_fragment(frame.flags, &frame.payload) {
-                                log_info(&format!("[AAP Session] Video Access Unit assembled: is_config={}, len={}, completes_data={}", unit.is_config, unit.data.len(), unit.completes_data));
                                 if let Some(dec) = decoder.as_mut() {
                                     dec.feed_packet(&unit.data, unit.timestamp_us, unit.is_config);
                                 }
                                 if unit.completes_data {
-                                    log_info(&format!("[AAP Session] Emitting MEDIA_MESSAGE_ACK (session_id={})", video_session_id));
                                     let ack = build_media_ack(video_session_id);
-                                    let _ = write_frame(stream, &mut active_tls, ID_VID, FLAG_SINGLE, &ack, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_VID, FLAG_SINGLE, &ack, true);
                                 }
                             }
                         }
@@ -563,13 +592,13 @@ fn handle_aap_session(
                                     // CHANNEL_OPEN_REQUEST
                                     log_info("[AAP Session] Input Channel Open Request -> OK");
                                     let resp = build_channel_open_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_INP, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_INP, FLAG_SINGLE, &resp, true);
                                 }
                                 0x8002 => {
                                     // BINDINGREQUEST -> BINDINGRESPONSE
                                     log_info("[AAP Session] Input KeyBinding Request -> Replying SUCCESS");
                                     let resp = build_input_binding_response();
-                                    let _ = write_frame(stream, &mut active_tls, ID_INP, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_INP, FLAG_SINGLE, &resp, true);
                                 }
                                 _ => {}
                             }
@@ -584,14 +613,14 @@ fn handle_aap_session(
                                     // CHANNEL_OPEN_REQUEST
                                     log_info(&format!("[AAP Session] Audio Channel {} Open Request -> OK", channel));
                                     let resp = build_channel_open_response();
-                                    let _ = write_frame(stream, &mut active_tls, channel, FLAG_SINGLE, &resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, channel, FLAG_SINGLE, &resp, true);
                                 }
                                 0x8000 => {
                                     // MEDIA_MESSAGE_SETUP -> CONFIG & AUDIO_FOCUS_NOTIFICATION
                                     let config_resp = build_media_config_response(30);
-                                    let _ = write_frame(stream, &mut active_tls, channel, FLAG_SINGLE, &config_resp, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, channel, FLAG_SINGLE, &config_resp, true);
                                     let af_notif = build_audio_focus_notification();
-                                    let _ = write_frame(stream, &mut active_tls, ID_CTR, FLAG_SINGLE, &af_notif, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_CTR, FLAG_SINGLE, &af_notif, true);
                                     log_info(&format!("[AAP Session] Audio Channel {} Setup -> Config READY & Audio Focus GAIN", channel));
                                 }
                                 0x8001 => {
@@ -607,11 +636,11 @@ fn handle_aap_session(
                                     if data.len() > pcm_offset {
                                         let pcm_bytes = &data[pcm_offset..];
                                         if let Some(sink) = audio_sink.as_mut() {
-                                            sink.write_pcm_i16(pcm_bytes);
+                                             sink.write_pcm_i16(pcm_bytes);
                                         }
                                     }
                                     let ack = build_media_ack(audio_session_id);
-                                    let _ = write_frame(stream, &mut active_tls, channel, FLAG_SINGLE, &ack, true);
+                                    let _ = write_frame(&mut write_stream, &session_tls, channel, FLAG_SINGLE, &ack, true);
                                 }
                                 _ => {}
                             }
@@ -621,17 +650,18 @@ fn handle_aap_session(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Render any pending decoded video frames
-                if let Some(dec) = decoder.as_mut() {
-                    dec.render_available_frames();
-                }
-                thread::sleep(Duration::from_millis(2));
+                log_info("[AAP Session] Connection idle timeout (15s)");
+                break;
             }
             Err(e) => {
                 log_err(&format!("[AAP Session] Client disconnected or read error: {}", e));
                 break;
             }
         }
+    }
+
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        *guard = None;
     }
 
     if let Some(dec) = decoder.as_mut() {

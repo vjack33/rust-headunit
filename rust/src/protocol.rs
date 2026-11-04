@@ -27,9 +27,11 @@ pub struct AapFrame {
     pub payload: Vec<u8>,
 }
 
+use std::sync::{Arc, Mutex};
+
 pub fn read_frame(
     stream: &mut TcpStream,
-    tls: &mut Option<ClientConnection>,
+    tls: &Arc<Mutex<Option<ClientConnection>>>,
 ) -> std::io::Result<AapFrame> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
@@ -51,7 +53,8 @@ pub fn read_frame(
     }
 
     if (flags & FLAG_ENCRYPTED) != 0 {
-        if let Some(ref mut conn) = tls {
+        let mut guard = tls.lock().unwrap();
+        if let Some(ref mut conn) = *guard {
             let mut cursor = Cursor::new(&body);
             let mut plain = Vec::new();
 
@@ -93,13 +96,6 @@ pub fn read_frame(
                 let _ = conn.reader().read_to_end(&mut plain);
             }
 
-            if plain.is_empty() && len > 0 {
-                crate::log_info(&format!(
-                    "[read_frame] Encrypted frame produced 0 plaintext bytes (chan={}, wire_flags=0x{:02X}, enc_len={}, cursor_pos={}/{}, body_preview={:02X?})",
-                    channel, flags, len, cursor.position(), body.len(), &body[..std::cmp::min(body.len(), 16)]
-                ));
-            }
-
             return Ok(AapFrame {
                 channel,
                 flags: flags & !FLAG_ENCRYPTED,
@@ -117,7 +113,7 @@ pub fn read_frame(
 
 pub fn write_frame(
     stream: &mut TcpStream,
-    tls: &mut Option<ClientConnection>,
+    tls: &Arc<Mutex<Option<ClientConnection>>>,
     channel: u8,
     mut flags: u8,
     payload: &[u8],
@@ -133,7 +129,8 @@ pub fn write_frame(
     }
 
     if encrypt {
-        if let Some(ref mut conn) = tls {
+        let mut guard = tls.lock().unwrap();
+        if let Some(ref mut conn) = *guard {
             conn.writer().write_all(payload)?;
             let mut cipher = Vec::new();
             conn.write_tls(&mut cipher)?;
@@ -211,9 +208,10 @@ impl VideoAssembler {
 
                 if is_last {
                     self.assembling = false;
+                    let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                     return Some(VideoAccessUnit {
                         is_config: false,
-                        data: self.buffer.clone(),
+                        data,
                         completes_data: true,
                         timestamp_us: self.timestamp_us,
                     });
@@ -228,9 +226,10 @@ impl VideoAssembler {
 
                 if is_last {
                     self.assembling = false;
+                    let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                     return Some(VideoAccessUnit {
                         is_config: true,
-                        data: self.buffer.clone(),
+                        data,
                         completes_data: false,
                         timestamp_us: 0,
                     });
@@ -250,11 +249,15 @@ impl VideoAssembler {
 
             if is_last {
                 self.assembling = false;
+                let is_cfg = self.current_type == 1;
+                let completes = self.current_type == 0;
+                let ts = self.timestamp_us;
+                let data = std::mem::replace(&mut self.buffer, Vec::with_capacity(128 * 1024));
                 return Some(VideoAccessUnit {
-                    is_config: self.current_type == 1,
-                    data: self.buffer.clone(),
-                    completes_data: self.current_type == 0,
-                    timestamp_us: self.timestamp_us,
+                    is_config: is_cfg,
+                    data,
+                    completes_data: completes,
+                    timestamp_us: ts,
                 });
             } else {
                 return None;
@@ -311,20 +314,30 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_uint32(1, ID_SEN as u32, &mut chan_sen);
     encode_submsg(2, &sensors_sub, &mut chan_sen); // sensor_source_service = 2
 
-    // 2. Channel 2: Video (1280x720, 30 FPS, 160 DPI, H.264 Baseline Profile)
-    let mut vc = Vec::new();
-    encode_uint32(1, 2, &mut vc); // codec_resolution = _1280x720 (2)
-    encode_uint32(2, 2, &mut vc); // frame_rate = _30 (2)
-    encode_uint32(3, 0, &mut vc); // margin width = 0
-    encode_uint32(4, 0, &mut vc); // margin height = 0
-    encode_uint32(5, 160, &mut vc); // density = 160
-    encode_uint32(8, 10000, &mut vc); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
-    encode_uint32(10, 3, &mut vc); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
+    // 2. Channel 2: Video (1280x720, 60 FPS & 30 FPS, 160 DPI, H.264 Baseline Profile)
+    let mut vc60 = Vec::new();
+    encode_uint32(1, 2, &mut vc60); // codec_resolution = _1280x720 (2)
+    encode_uint32(2, 1, &mut vc60); // frame_rate = _60 (1) - 60 FPS buttery smooth
+    encode_uint32(3, 0, &mut vc60); // margin width = 0
+    encode_uint32(4, 0, &mut vc60); // margin height = 0
+    encode_uint32(5, 160, &mut vc60); // density = 160
+    encode_uint32(8, 10000, &mut vc60); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
+    encode_uint32(10, 3, &mut vc60); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
+
+    let mut vc30 = Vec::new();
+    encode_uint32(1, 2, &mut vc30); // codec_resolution = _1280x720 (2)
+    encode_uint32(2, 2, &mut vc30); // frame_rate = _30 (2)
+    encode_uint32(3, 0, &mut vc30); // margin width = 0
+    encode_uint32(4, 0, &mut vc30); // margin height = 0
+    encode_uint32(5, 160, &mut vc30); // density = 160
+    encode_uint32(8, 10000, &mut vc30); // pixel_aspect_ratio_e4 = 10000 (1:1 square)
+    encode_uint32(10, 3, &mut vc30); // video_codec_type = MEDIA_CODEC_VIDEO_H264_BP (3)
 
     let mut av_vid = Vec::new();
     encode_uint32(1, 3, &mut av_vid); // available_type = H264_BP (3)
     encode_uint32(2, 0, &mut av_vid); // audio_type = NONE (0)
-    encode_submsg(4, &vc, &mut av_vid); // video_configs = 4
+    encode_submsg(4, &vc60, &mut av_vid); // video_configs[0] = 60fps (primary)
+    encode_submsg(4, &vc30, &mut av_vid); // video_configs[1] = 30fps (fallback)
     encode_bool(5, true, &mut av_vid); // available_while_in_call = true
 
     let mut chan_vid = Vec::new();

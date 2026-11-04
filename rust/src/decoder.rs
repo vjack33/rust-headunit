@@ -1,5 +1,8 @@
 #![allow(non_snake_case, dead_code)]
 use std::ffi::{c_char, c_int, c_void, CString};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 #[repr(C)]
 struct AMediaCodecBufferInfo {
@@ -45,6 +48,8 @@ extern "C" {
         timeoutUs: i64,
     ) -> isize;
     fn AMediaCodec_releaseOutputBuffer(codec: *mut c_void, idx: usize, render: bool) -> c_int;
+
+    fn setpriority(which: c_int, who: c_int, prio: c_int) -> c_int;
 }
 
 fn log(msg: &str) {
@@ -57,7 +62,9 @@ fn log(msg: &str) {
 
 pub struct HardwareVideoDecoder {
     codec: *mut c_void,
-    frame_count: u64,
+    is_running: Arc<AtomicBool>,
+    output_thread: Option<thread::JoinHandle<()>>,
+    frame_count: Arc<AtomicU64>,
 }
 
 unsafe impl Send for HardwareVideoDecoder {}
@@ -70,10 +77,10 @@ impl HardwareVideoDecoder {
             return None;
         }
 
-        unsafe {
+        let codec = unsafe {
             let mime = CString::new("video/avc").unwrap();
-            let codec = AMediaCodec_createDecoderByType(mime.as_ptr());
-            if codec.is_null() {
+            let c = AMediaCodec_createDecoderByType(mime.as_ptr());
+            if c.is_null() {
                 log("[FAIL] Could not create video/avc decoder");
                 return None;
             }
@@ -82,36 +89,84 @@ impl HardwareVideoDecoder {
             let key_mime = CString::new("mime").unwrap();
             let key_width = CString::new("width").unwrap();
             let key_height = CString::new("height").unwrap();
-
+            let key_max_input = CString::new("max-input-size").unwrap();
             AMediaFormat_setString(format, key_mime.as_ptr(), mime.as_ptr());
             AMediaFormat_setInt32(format, key_width.as_ptr(), 1280);
             AMediaFormat_setInt32(format, key_height.as_ptr(), 720);
-            let key_max_input = CString::new("max-input-size").unwrap();
-            AMediaFormat_setInt32(format, key_max_input.as_ptr(), 1048576); // 1MB buffer
+            AMediaFormat_setInt32(format, key_max_input.as_ptr(), 2 * 1024 * 1024); // 2MB buffer
 
-            // Configure codec with ANativeWindow for zero-copy direct surface rendering
-            let res = AMediaCodec_configure(codec, format, native_window, std::ptr::null_mut(), 0);
+            let res = AMediaCodec_configure(c, format, native_window, std::ptr::null_mut(), 0);
             AMediaFormat_delete(format);
 
             if res != 0 {
                 log(&format!("[FAIL] AMediaCodec_configure returned {}", res));
-                AMediaCodec_delete(codec);
+                AMediaCodec_delete(c);
                 return None;
             }
 
-            let start_res = AMediaCodec_start(codec);
+            let start_res = AMediaCodec_start(c);
             if start_res != 0 {
                 log(&format!("[FAIL] AMediaCodec_start returned {}", start_res));
-                AMediaCodec_delete(codec);
+                AMediaCodec_delete(c);
                 return None;
             }
 
-            log("[OK] Qualcomm Venus H.264 HW Decoder initialized & bound to ANativeWindow");
-            Some(Self {
-                codec,
-                frame_count: 0,
+            log("[OK] Qualcomm Venus H.264 HW Decoder started cleanly");
+            c
+        };
+
+        let is_running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&is_running);
+        let frame_count = Arc::new(AtomicU64::new(0));
+        let count_clone = Arc::clone(&frame_count);
+        let codec_usize = codec as usize;
+
+        // Dedicated high-priority output thread for immediate zero-latency frame presentation
+        let output_thread = thread::Builder::new()
+            .name("VenusOutput".to_string())
+            .spawn(move || {
+                unsafe {
+                    setpriority(0, 0, -10); // Realtime display scheduling priority
+                    let codec_ptr = codec_usize as *mut c_void;
+                    let mut info = AMediaCodecBufferInfo {
+                        offset: 0,
+                        size: 0,
+                        presentationTimeUs: 0,
+                        flags: 0,
+                    };
+
+                    while running_clone.load(Ordering::Relaxed) {
+                        let out_idx = AMediaCodec_dequeueOutputBuffer(codec_ptr, &mut info, 5000); // 5ms timeout
+                        if out_idx >= 0 {
+                            AMediaCodec_releaseOutputBuffer(codec_ptr, out_idx as usize, true);
+                            let total = count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                            if total % 300 == 0 {
+                                log(&format!("[Decoder] Rendered {} frames smoothly", total));
+                            }
+                            // Drain any additional immediately ready frames with 0 timeout
+                            loop {
+                                let next_idx = AMediaCodec_dequeueOutputBuffer(codec_ptr, &mut info, 0);
+                                if next_idx >= 0 {
+                                    AMediaCodec_releaseOutputBuffer(codec_ptr, next_idx as usize, true);
+                                    count_clone.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else if out_idx == -2 || out_idx == -3 {
+                            continue;
+                        }
+                    }
+                }
             })
-        }
+            .ok();
+
+        Some(Self {
+            codec,
+            is_running,
+            output_thread,
+            frame_count,
+        })
     }
 
     pub fn feed_packet(&mut self, data: &[u8], pts: u64, is_config: bool) {
@@ -122,7 +177,7 @@ impl HardwareVideoDecoder {
         unsafe {
             let mut in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 10000); // 10ms timeout
             if in_idx < 0 {
-                in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 10000);
+                in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 5000);
             }
             if in_idx >= 0 {
                 let mut out_size: usize = 0;
@@ -138,49 +193,6 @@ impl HardwareVideoDecoder {
                         pts,
                         flags,
                     );
-                    log(&format!("[Decoder] Queued input buffer (len={}, is_config={}, pts={})", data.len(), is_config, pts));
-                } else if out_size < data.len() {
-                    log(&format!("[Decoder] Input buffer capacity too small: {} < {}", out_size, data.len()));
-                }
-            } else {
-                log("[Decoder] dequeueInputBuffer timed out (busy)");
-            }
-
-            // Immediately flush/render any decoded output buffers
-            self.render_available_frames();
-        }
-    }
-
-    pub fn render_available_frames(&mut self) {
-        if self.codec.is_null() {
-            return;
-        }
-
-        unsafe {
-            let mut info = AMediaCodecBufferInfo {
-                offset: 0,
-                size: 0,
-                presentationTimeUs: 0,
-                flags: 0,
-            };
-
-            for _ in 0..16 {
-                let out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0);
-                if out_idx >= 0 {
-                    // render=true directly sends decoded frame buffer to Surface overlay
-                    AMediaCodec_releaseOutputBuffer(self.codec, out_idx as usize, true);
-                    self.frame_count += 1;
-                    log(&format!("[Decoder] Rendered frame #{} on ANativeWindow", self.frame_count));
-                } else if out_idx == -2 {
-                    // AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED
-                    log("[Decoder] AMediaCodec output format changed");
-                    continue;
-                } else if out_idx == -3 {
-                    // AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED
-                    log("[Decoder] AMediaCodec output buffers changed");
-                    continue;
-                } else {
-                    break;
                 }
             }
         }
@@ -188,6 +200,10 @@ impl HardwareVideoDecoder {
 
     pub fn close(&mut self) {
         if !self.codec.is_null() {
+            self.is_running.store(false, Ordering::SeqCst);
+            if let Some(handle) = self.output_thread.take() {
+                let _ = handle.join();
+            }
             unsafe {
                 AMediaCodec_stop(self.codec);
                 AMediaCodec_delete(self.codec);
