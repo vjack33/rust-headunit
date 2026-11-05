@@ -407,6 +407,21 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_uint32(1, ID_AUD as u32, &mut chan_med);
     encode_submsg(3, &av_med, &mut chan_med);
 
+    // 7. Channel 7: Microphone (16000 Hz, 16-bit, 1 ch PCM)
+    let mut ac_mic = Vec::new();
+    encode_uint32(1, 16000, &mut ac_mic);
+    encode_uint32(2, 16, &mut ac_mic);
+    encode_uint32(3, 1, &mut ac_mic);
+
+    let mut av_mic = Vec::new();
+    encode_uint32(1, 1, &mut av_mic); // PCM (1)
+    encode_uint32(2, 1, &mut av_mic); // SPEECH (1)
+    encode_submsg(3, &ac_mic, &mut av_mic);
+
+    let mut chan_mic = Vec::new();
+    encode_uint32(1, ID_MIC as u32, &mut chan_mic);
+    encode_submsg(5, &av_mic, &mut chan_mic); // media_source_service = 5
+
     // Assemble all services (Field 1)
     encode_submsg(1, &chan_sen, &mut out);
     encode_submsg(1, &chan_vid, &mut out);
@@ -414,10 +429,17 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_submsg(1, &chan_sys, &mut out);
     encode_submsg(1, &chan_sp, &mut out);
     encode_submsg(1, &chan_med, &mut out);
+    encode_submsg(1, &chan_mic, &mut out);
 
-    // Vehicle strings & session parameters
-    encode_string(2, "Kawasaki", &mut out);
-    encode_string(3, "Ninja", &mut out);
+    // HeadUnitInfo & Vehicle strings - Dynamic vehicle type (3 = Bike/Motorcycle, 1 = Car)
+    let (make, model) = if vehicle_type == 3 {
+        ("Kawasaki", "Ninja") // Motorcycle
+    } else {
+        ("Honda", "Civic") // Car
+    };
+
+    encode_string(2, make, &mut out);
+    encode_string(3, model, &mut out);
     encode_string(4, "2025", &mut out);
     encode_string(5, "OpenHeadUnit-Rust-01", &mut out);
     encode_uint32(6, 0, &mut out); // driver_position = LEFT (0)
@@ -429,12 +451,6 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_bool(12, false, &mut out); // hide_projected_clock
     encode_string(14, "Oppo A37 AA", &mut out);
 
-    // HeadUnitInfo (Field 17) - Dynamic vehicle type (3 = Bike/Motorcycle, 1 = Car)
-    let (make, model) = if vehicle_type == 3 {
-        ("Kawasaki", "Ninja") // Motorcycle
-    } else {
-        ("Honda", "Civic") // Car
-    };
     let mut hui = Vec::new();
     encode_string(1, make, &mut hui);
     encode_string(2, model, &mut hui);
@@ -447,6 +463,15 @@ pub fn build_service_discovery_response() -> Vec<u8> {
     encode_uint32(9, vehicle_type, &mut hui);
     encode_submsg(17, &hui, &mut out);
 
+    out
+}
+
+// Microphone Open Response (MICROPHONE_OPEN_RESPONSE: 0x8006)
+pub fn build_microphone_open_response() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x80, 0x06]);
+    encode_uint32(1, 0, &mut out); // status = STATUS_SUCCESS (0)
+    encode_uint32(2, 16000, &mut out); // sample_rate = 16000
     out
 }
 

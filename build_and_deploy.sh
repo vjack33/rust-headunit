@@ -32,7 +32,7 @@ aapt2 compile --dir "$PROJ/res" -o "$PROJ/build/res.zip"
 aapt2 link -I "$ANDROID_JAR" \
   --manifest "$PROJ/AndroidManifest.xml" \
   --min-sdk-version 21 \
-  --target-sdk-version 30 \
+  --target-sdk-version 28 \
   "$PROJ/build/res.zip" \
   -o "$PROJ/build/unaligned.apk"
 
@@ -51,6 +51,7 @@ adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.INTERNE
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true"
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.ACCESS_COARSE_LOCATION 2>/dev/null || true"
 adb -s 9da08b05 shell "pm grant com.openheadunit.rust android.permission.RECORD_AUDIO 2>/dev/null || true"
+adb -s 9da08b05 shell "su -c 'appops set com.openheadunit.rust FINE_LOCATION allow; appops set com.openheadunit.rust COARSE_LOCATION allow' 2>/dev/null || true"
 
 echo "=== Launching com.openheadunit.rust ==="
 adb -s 9da08b05 shell "am force-stop com.openheadunit.rust"

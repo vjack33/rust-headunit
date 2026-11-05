@@ -721,6 +721,43 @@ fn handle_aap_session(
                             }
                         }
                     }
+                    ID_MIC => {
+                        // Channel 7: Microphone Channel
+                        if data.len() >= 2 {
+                            let ctrl_type = u16::from_be_bytes([data[0], data[1]]);
+                            match ctrl_type {
+                                0x0007 => {
+                                    // CHANNEL_OPEN_REQUEST
+                                    log_info("[AAP Session] Mic Channel 7 Open Request -> OK");
+                                    let resp = build_channel_open_response();
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_MIC, FLAG_SINGLE, &resp, true);
+                                }
+                                0x8000 => {
+                                    // MEDIA_MESSAGE_SETUP -> CONFIG
+                                    log_info("[AAP Session] Mic Channel 7 Setup Request -> Config READY");
+                                    let config_resp = build_media_config_response(0);
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_MIC, FLAG_SINGLE, &config_resp, true);
+                                }
+                                0x8005 => {
+                                    // MICROPHONE_OPEN_REQUEST -> MICROPHONE_OPEN_RESPONSE
+                                    log_info("[AAP Session] Mic Channel 7 Microphone Open Request -> Replying SUCCESS");
+                                    let resp = build_microphone_open_response();
+                                    let _ = write_frame(&mut write_stream, &session_tls, ID_MIC, FLAG_SINGLE, &resp, true);
+                                }
+                                0x8001 => {
+                                    // MEDIA_MESSAGE_START (Mic stream start)
+                                    log_info("[AAP Session] Mic Stream Started");
+                                }
+                                0x8002 => {
+                                    // MEDIA_MESSAGE_STOP (Mic stream stop)
+                                    log_info("[AAP Session] Mic Stream Stopped");
+                                }
+                                _ => {
+                                    log_info(&format!("[AAP Session] Mic Channel 7 msg: 0x{:04x}", ctrl_type));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

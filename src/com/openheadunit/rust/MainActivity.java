@@ -129,14 +129,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile String p2pSsid = "DIRECT-GR-OppoA37";
     private volatile String p2pPass = "zdJkw85SwLG7";
     private volatile String p2pBssid = "AA:1B:5A:15:B8:3D";
-    private volatile String p2pGoIp  = "192.168.37.100";
+    private volatile String p2pGoIp  = null;
     private static final int AAP_PORT    = 5288;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON |
+                             WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD |
+                             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED |
+                             WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        }
 
         hideSystemUI();
 
@@ -1302,70 +1309,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             registerP2pReceiver();
 
-            // Populate live credentials from any currently active group
-            queryP2pLiveInfo();
-
-            // Remove any stale group first, then create fresh group
-            p2pManager.removeGroup(p2pChannel, new WifiP2pManager.ActionListener() {
-                @Override
-                public void onSuccess() { createP2pGroup(); }
-                @Override
-                public void onFailure(int reason) { createP2pGroup(); }
-            });
+            // Allow AsyncChannel handshake to complete before issuing P2P commands
+            uiHandler.postDelayed(() -> {
+                if (p2pManager == null || p2pChannel == null) return;
+                p2pManager.requestGroupInfo(p2pChannel, group -> {
+                    if (group != null) {
+                        Log.i(TAG, "[P2P] Existing group active: " + group.getNetworkName());
+                        queryP2pLiveInfo();
+                    } else {
+                        Log.i(TAG, "[P2P] No group active, creating standard P2P group...");
+                        createStandardP2pGroup();
+                    }
+                });
+            }, 600);
         } catch (Exception e) {
             Log.e(TAG, "[P2P] Error initializing P2P: " + e.getMessage());
         }
     }
 
-    private void createP2pGroup() {
-        if (p2pManager == null || p2pChannel == null) return;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                WifiP2pConfig.Builder configBuilder = new WifiP2pConfig.Builder();
-                configBuilder.setNetworkName("DIRECT-GR-OppoA37");
-                configBuilder.setPassphrase("zdJkw85SwLG7");
-                configBuilder.setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ);
-                configBuilder.enablePersistentMode(true);
-                WifiP2pConfig config = configBuilder.build();
-
-                Log.i(TAG, "[P2P] Creating group with fixed credentials: DIRECT-GR-OppoA37 / zdJkw85SwLG7...");
-                p2pManager.createGroup(p2pChannel, config, new WifiP2pManager.ActionListener() {
-                    @Override
-                    public void onSuccess() {
-                        Log.i(TAG, "[P2P] createGroup with config SUCCESS!");
-                        queryP2pLiveInfo();
-                    }
-
-                    @Override
-                    public void onFailure(int reason) {
-                        Log.w(TAG, "[P2P] createGroup with config failed (" + reason + "), falling back to standard createGroup...");
-                        createStandardP2pGroup();
-                    }
-                });
-                return;
-            } catch (Exception e) {
-                Log.w(TAG, "[P2P] createGroup with config threw: " + e.getMessage());
-            }
-        }
-        createStandardP2pGroup();
-    }
-
     private void createStandardP2pGroup() {
+        if (p2pManager == null || p2pChannel == null) return;
         p2pManager.createGroup(p2pChannel, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
                 Log.i(TAG, "[P2P] standard createGroup SUCCESS! Waiting for group formation...");
-                new Thread(() -> {
-                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                    queryP2pLiveInfo();
-                }).start();
+                uiHandler.postDelayed(() -> queryP2pLiveInfo(), 1000);
             }
 
             @Override
             public void onFailure(int reason) {
-                Log.w(TAG, "[P2P] standard createGroup failed with reason: " + reason);
-                queryP2pLiveInfo();
+                Log.w(TAG, "[P2P] standard createGroup result: " + reason + ", checking live group status...");
+                uiHandler.postDelayed(() -> queryP2pLiveInfo(), 1500);
             }
         });
     }
@@ -1409,10 +1383,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
 
             try {
-                aaServerSocket = adapter.listenUsingInsecureRfcommWithServiceRecord("AndroidAuto", AA_WIRELESS_UUID);
-                Log.i(TAG, "[AA-SERVER] Listening on UUID " + AA_WIRELESS_UUID + " with service record 'AndroidAuto'");
+                // Ensure device is named clearly for Android Auto discovery
+                try {
+                    String curName = adapter.getName();
+                    if (curName == null || !curName.contains("AA")) {
+                        adapter.setName("Oppo A37 AA");
+                    }
+                } catch (Exception ignored) {}
 
-                while (isRunning.get()) {
+                // Ensure connectable & discoverable
+                try {
+                    java.lang.reflect.Method m = adapter.getClass().getMethod("setScanMode", int.class);
+                    m.invoke(adapter, BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+                } catch (Exception ignored) {}
+
+                // Prefer Secure RFCOMM (official Android Auto specification), fallback to Insecure if needed
+                BluetoothServerSocket serverSocket = null;
+                try {
+                    serverSocket = adapter.listenUsingRfcommWithServiceRecord("AndroidAuto", AA_WIRELESS_UUID);
+                    Log.i(TAG, "[AA-SERVER] Listening on SECURE RFCOMM UUID " + AA_WIRELESS_UUID + " with service record 'AndroidAuto'");
+                } catch (IOException e) {
+                    Log.w(TAG, "[AA-SERVER] Secure RFCOMM failed: " + e.getMessage() + ", falling back to Insecure");
+                    serverSocket = adapter.listenUsingInsecureRfcommWithServiceRecord("AndroidAuto", AA_WIRELESS_UUID);
+                    Log.i(TAG, "[AA-SERVER] Listening on INSECURE RFCOMM UUID " + AA_WIRELESS_UUID);
+                }
+                aaServerSocket = serverSocket;
+
+                while (isRunning.get() && aaServerSocket != null) {
                     try {
                         BluetoothSocket socket = aaServerSocket.accept();
                         if (socket != null) {
@@ -1621,36 +1618,52 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private String getLocalWifiIp() {
+        try {
+            // Priority 1: Direct scan of active kernel p2p interfaces (highest priority for Wi-Fi Direct)
+            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (nif.isUp() && nif.getName().startsWith("p2p")) {
+                    for (InetAddress addr : Collections.list(nif.getInetAddresses())) {
+                        if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) {
+                            String ip = addr.getHostAddress();
+                            if (ip != null && !ip.isEmpty() && !"0.0.0.0".equals(ip)) {
+                                Log.i(TAG, "[IP DYNAMIC] Found live P2P interface " + nif.getName() + " with IP: " + ip);
+                                return ip;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed reading p2p interfaces: " + e.getMessage());
+        }
+
+        // Priority 2: P2P Group Owner IP reported by Android WifiP2pManager
         if (p2pGoIp != null && !p2pGoIp.isEmpty() && !"0.0.0.0".equals(p2pGoIp)) {
+            Log.i(TAG, "[IP DYNAMIC] Using WifiP2pManager reported GO IP: " + p2pGoIp);
             return p2pGoIp;
         }
+
         try {
+            // Priority 3: Active WLAN interface (Hotspot or local Wi-Fi)
             for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                if (nif.getName().startsWith("p2p")) {
+                if (nif.isUp() && nif.getName().startsWith("wlan")) {
                     for (InetAddress addr : Collections.list(nif.getInetAddresses())) {
                         if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) {
                             String ip = addr.getHostAddress();
-                            if (ip != null && !ip.isEmpty()) {
+                            if (ip != null && !ip.isEmpty() && !"0.0.0.0".equals(ip)) {
+                                Log.i(TAG, "[IP DYNAMIC] Found live WLAN interface " + nif.getName() + " with IP: " + ip);
                                 return ip;
                             }
                         }
                     }
                 }
             }
-            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                if (nif.getName().startsWith("wlan")) {
-                    for (InetAddress addr : Collections.list(nif.getInetAddresses())) {
-                        if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) {
-                            String ip = addr.getHostAddress();
-                            if (ip != null && !ip.isEmpty()) {
-                                return ip;
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception ignored) {}
-        return "192.168.37.100";
+        } catch (Exception e) {
+            Log.w(TAG, "Failed reading wlan interfaces: " + e.getMessage());
+        }
+
+        Log.w(TAG, "[IP DYNAMIC] No live interface found, using default 192.168.49.1");
+        return "192.168.49.1";
     }
 
     // --- Protobuf wire-format builders ---
